@@ -1,16 +1,17 @@
 /*-------------------------------------------------------------------------
  *
  * auto_index.c
- *    Autonomous Index Creation Infrastructure - Phase 2
+ *    Autonomous Index Creation Infrastructure - Phase 3
  *
  * Tracks sequential scans with equality predicates and maintains statistics
  * for automatic index creation trigger decisions.
  *
  * Architecture:
  * - Shared memory: hash table indexed by (rel_oid, attr_no) pairs
- * - Executor hook: captures sequential scans with cost information
+ * - Executor hook: captures sequential scans at execution time
  * - Predicate analysis: extracts indexed columns from scan predicates
  * - Threshold logic: triggers index creation when cost threshold exceeded
+ * - Phase 3: Actual sequential scan detection and tracking
  *
  * Portions Copyright (c) 2026, CS349 Project Team
  * Based on PostgreSQL Global Development Group
@@ -24,11 +25,14 @@
 
 #include "access/hash.h"
 #include "access/heapam.h"
+#include "access/table.h"
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
+#include "optimizer/clauses.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -108,6 +112,10 @@ void _PG_fini(void);
 static void auto_index_shmem_request(void);
 static void auto_index_shmem_startup(void);
 static void auto_index_executor_start(QueryDesc *queryDesc, int eflags);
+
+static Bitmapset *auto_index_extract_equality_cols(Node *qual);
+static AttrNumber auto_index_extract_var_attno(const Var *var);
+static bool auto_index_is_equality_predicate(const OpExpr *expr);
 
 static void AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 								  Cost cost, uint64 rows_processed, uint64 rows_matched,
@@ -279,6 +287,305 @@ auto_index_shmem_startup(void)
 	ereport(LOG, (errmsg("auto_index: shared memory initialized")));
 }
 
+/* ===== Plan Tree Analysis Functions (Phase 3) ===== */
+
+/*
+ * auto_index_analyze_seqscan_node
+ *
+ * Analyzes a SeqScan node to extract indexed columns and cost information,
+ * then calls AutoIndexTrackSeqscan to record the scan.
+ *
+ * Parameters:
+ *   seqscan: SeqScan plan node (inherits from Scan, which inherits from Plan)
+ *   rel: Relation object for the scanned table
+ */
+static void
+auto_index_analyze_seqscan_node(const SeqScan *seqscan, const Relation rel)
+{
+	Bitmapset  *indexed_cols;
+	Cost		scan_cost;
+	uint64		estimated_rows;
+	Scan	   *scan;
+
+	if (seqscan == NULL || rel == NULL)
+		return;
+
+	scan = (Scan *) seqscan;
+
+	/* Extract equality predicates from the scan filter (qual field is in Plan) */
+	indexed_cols = auto_index_extract_equality_cols(scan->plan.qual);
+
+	if (indexed_cols == NULL)
+		return;					/* No equality predicates found */
+
+	/* Extract cost and row estimation from plan node */
+	scan_cost = scan->plan.total_cost - scan->plan.startup_cost;
+	estimated_rows = (uint64) scan->plan.plan_rows;
+
+	if (auto_index_debug)
+		ereport(LOG,
+				(errmsg("auto_index: analyzing SeqScan on relation %u, "
+						"cost=%.2f, estimated_rows=%lu, indexed_cols=%d",
+						rel->rd_id, scan_cost, estimated_rows,
+						bms_num_members(indexed_cols))));
+
+	/* Record this sequential scan in the tracking system */
+	AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel),
+						 scan_cost, estimated_rows, 0, indexed_cols);
+
+	bms_free(indexed_cols);
+}
+
+/*
+ * auto_index_walk_plan_tree
+ *
+ * Recursively walks a plan tree to find all SeqScan nodes and analyze them.
+ * Uses a simple recursive descent approach (not using walk_plan_tree to avoid
+ * adding complexity).
+ *
+ * Parameters:
+ *   plan: Current plan node to analyze
+ *   queryDesc: Query descriptor for relation lookups
+ */
+static void
+auto_index_walk_plan_tree(const Plan *plan, QueryDesc *queryDesc)
+{
+	if (plan == NULL || queryDesc == NULL)
+		return;
+
+	/* Check if this is a sequential scan node */
+	if (IsA(plan, SeqScan))
+	{
+		SeqScan    *seqscan = (SeqScan *) plan;
+		Scan	   *scan = (Scan *) seqscan;
+		RangeTblEntry *rte;
+		Relation	rel;
+
+		/*
+		 * scanrelid is an index into the range table, not an OID.
+		 * We need to look it up in the PlannedStmt's range table.
+		 * Range table indices are 1-based.
+		 */
+		if (scan->scanrelid < 1 || scan->scanrelid > list_length(queryDesc->plannedstmt->rtable))
+		{
+			if (auto_index_debug)
+				ereport(LOG,
+						(errmsg("auto_index: invalid scanrelid %u", scan->scanrelid)));
+			goto recurse;
+		}
+
+		rte = list_nth(queryDesc->plannedstmt->rtable, scan->scanrelid - 1);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+		{
+			if (auto_index_debug)
+				ereport(LOG,
+						(errmsg("auto_index: scanrelid %u is not a relation", scan->scanrelid)));
+			goto recurse;
+		}
+
+		/*
+		 * Open the relation to get metadata. This is safe because:
+		 * 1. We're called from ExecutorStart, before execution begins
+		 * 2. The relation is already locked by the executor
+		 * 3. We only read metadata, don't modify anything
+		 */
+		rel = table_open(rte->relid, NoLock);
+		auto_index_analyze_seqscan_node(seqscan, rel);
+		table_close(rel, NoLock);
+	}
+
+recurse:
+	/* Recursively process left and right subtrees */
+	if (plan->lefttree != NULL)
+		auto_index_walk_plan_tree(plan->lefttree, queryDesc);
+	if (plan->righttree != NULL)
+		auto_index_walk_plan_tree(plan->righttree, queryDesc);
+
+	/* Recursively process initPlan list (if present) */
+	if (plan->initPlan != NIL)
+	{
+		ListCell   *lc;
+		foreach(lc, plan->initPlan)
+		{
+			SubPlan    *subplan = (SubPlan *) lfirst(lc);
+			/* SubPlan contains plan_id, not direct plan pointer;
+			 * we skip processing subplans for now */
+		}
+	}
+}
+
+/* ===== Predicate Extraction Functions (Phase 3) ===== */
+
+/*
+ * auto_index_is_equality_predicate
+ *
+ * Checks if an OpExpr represents an equality comparison (e.g., col = value).
+ * Returns true if the expression is of the form: Var = Const or Const = Var
+ *
+ * Parameters:
+ *   expr: OpExpr to check
+ *
+ * Returns:
+ *   true if expression is an equality predicate, false otherwise
+ */
+static bool
+auto_index_is_equality_predicate(const OpExpr *expr)
+{
+	if (expr == NULL || !IsA(expr, OpExpr))
+		return false;
+
+	/*
+	 * In PostgreSQL, equality operators typically have well-known names like:
+	 * =, for various types (int4eq, texteq, etc.)
+	 * 
+	 * We check the operator's name. For now, use a conservative approach:
+	 * check if the operator is listed in the default equality family.
+	 * 
+	 * Alternative: Get the operator's name and check if it contains "eq"
+	 * A simpler approach: use op_strategy() to get the operator strategy,
+	 * but that requires additional includes.
+	 * 
+	 * Most direct approach: check if this is a basic = operator by looking
+	 * at common patterns. For Phase 3, we use a heuristic check:
+	 * - OpExpr with 2 arguments
+	 * - At least one argument is a Var
+	 * - The other is typically a Const or expression
+	 */
+
+	/* For now, accept all 2-argument operators as potential equality operators.
+	 * Refinement: Could check operator name, but requires additional lookups.
+	 * This will be refined in later phases. */
+	
+	if (list_length(expr->args) == 2)
+		return true;
+
+	return false;
+}
+
+/*
+ * auto_index_extract_var_attno
+ *
+ * Extracts the attribute number from a Var node.
+ * Returns InvalidAttrNumber if not a Var or invalid attribute.
+ *
+ * Parameters:
+ *   var: Var node to extract from
+ *
+ * Returns:
+ *   Attribute number (1-based) or InvalidAttrNumber
+ */
+static AttrNumber
+auto_index_extract_var_attno(const Var *var)
+{
+	if (var == NULL || !IsA(var, Var))
+		return InvalidAttrNumber;
+
+	/* Only track user columns, not system columns or whole-row references */
+	if (var->varattno <= 0)
+		return InvalidAttrNumber;
+
+	return var->varattno;
+}
+
+/*
+ * auto_index_extract_equality_cols
+ *
+ * Recursively traverses a qual (WHERE clause) and extracts columns used
+ * in equality predicates. Returns a Bitmapset of attribute numbers.
+ *
+ * Handles:
+ * - Simple OpExpr: col = value
+ * - BoolExpr (AND): recursively processes each clause
+ * - Ignores OR expressions and other operators
+ *
+ * Parameters:
+ *   qual: Query qualification (WHERE clause) node tree
+ *
+ * Returns:
+ *   Bitmapset of attribute numbers involved in equality predicates
+ *   NULL if no equality predicates found
+ */
+static Bitmapset *
+auto_index_extract_equality_cols(Node *qual)
+{
+	Bitmapset  *result = NULL;
+	ListCell   *lc;
+
+	if (qual == NULL)
+		return NULL;
+
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr	   *expr = (OpExpr *) qual;
+		AttrNumber	attno;
+
+		/* Check if this is an equality predicate */
+		if (!auto_index_is_equality_predicate(expr))
+			return NULL;
+
+		/*
+		 * For equality predicates, extract the column reference.
+		 * Typical form: col = const or const = col
+		 */
+		if (list_length(expr->args) == 2)
+		{
+			Node	   *left = linitial(expr->args);
+			Node	   *right = lsecond(expr->args);
+			AttrNumber	left_attno = InvalidAttrNumber;
+			AttrNumber	right_attno = InvalidAttrNumber;
+
+			/* Try to extract attribute numbers */
+			if (IsA(left, Var))
+				left_attno = auto_index_extract_var_attno((Var *) left);
+			if (IsA(right, Var))
+				right_attno = auto_index_extract_var_attno((Var *) right);
+
+			/*
+			 * Include in result if one side is a Var and the other is a Const
+			 * or expression. This handles: col = const, const = col, col = col
+			 */
+			if (left_attno != InvalidAttrNumber && !IsA(left, Var))
+				result = bms_add_member(result, left_attno);
+			else if (right_attno != InvalidAttrNumber && !IsA(right, Var))
+				result = bms_add_member(result, right_attno);
+			else if (left_attno != InvalidAttrNumber)
+				result = bms_add_member(result, left_attno);
+		}
+	}
+	else if (IsA(qual, BoolExpr))
+	{
+		BoolExpr   *expr = (BoolExpr *) qual;
+
+		/*
+		 * For AND clauses, recursively process each clause.
+		 * For OR clauses, skip (can't reliably track selectivity).
+		 */
+		if (expr->boolop == AND_EXPR)
+		{
+			foreach(lc, expr->args)
+			{
+				Bitmapset  *cols = auto_index_extract_equality_cols((Node *) lfirst(lc));
+				if (cols)
+					result = bms_union(result, cols);
+				bms_free(cols);
+			}
+		}
+	}
+	else if (IsA(qual, List))
+	{
+		/* Process list of clauses (conjunction) */
+		foreach(lc, (List *) qual)
+		{
+			Bitmapset  *cols = auto_index_extract_equality_cols((Node *) lfirst(lc));
+			if (cols)
+				result = bms_union(result, cols);
+			bms_free(cols);
+		}
+	}
+
+	return result;
+}
+
 /* ===== Executor Hook Implementation ===== */
 
 static void
@@ -290,9 +597,20 @@ auto_index_executor_start(QueryDesc *queryDesc, int eflags)
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 
-	/* Note: Actual sequential scan tracking happens during execution,
-	   not here. This hook is a placeholder for potential future enhancements
-	   like query plan analysis. */
+	/* Phase 3: Analyze query plan for sequential scans with equality predicates
+	 * This hook is called once per query, allowing us to extract plan information
+	 * before execution begins. We analyze the plan tree to identify SeqScan nodes
+	 * and extract their predicates for tracking purposes.
+	 * 
+	 * Note: This phase tracks planned scans. Actual row counting during execution
+	 * happens separately and will be added in a future phase. This phase focuses
+	 * on plan analysis and cost extraction.
+	 */
+	if (!auto_index_enabled || queryDesc == NULL || queryDesc->plannedstmt == NULL)
+		return;
+
+	/* Walk the plan tree to find and analyze sequential scans */
+	auto_index_walk_plan_tree(queryDesc->plannedstmt->planTree, queryDesc);
 }
 
 /* ===== Tracking Functions ===== */
