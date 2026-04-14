@@ -1,0 +1,6 @@
+# auto_index extension
+comment = 'Autonomous Index Creation - Automatically creates indices for frequently scanned columns'
+default_version = '1.0'
+module_pathname = '$libdir/auto_index'
+relocatable = false
+superuser = true

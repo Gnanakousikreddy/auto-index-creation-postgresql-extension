@@ -1,45 +1,26 @@
-# This file contains ignores for build artifacts from standard builds.
-# Auxiliary files from local workflows, your preferred editor, etc. should
-# be ignored locally using $GIT_DIR/info/exclude or ~/.gitexclude.
-
-# Global excludes across all subdirectories
+# Build artifacts
 *.o
-*.obj
-*.bc
 *.so
-*.so.[0-9]
-*.so.[0-9].[0-9]
-*.so.[0-9].[0-9][0-9]
-*.dylib
-*.dll
-*.exp
 *.a
-*.mo
-*.pot
-objfiles.txt
-.deps/
-*.gcno
+*.la
+*.pc
+*.bc
 *.gcda
-*.gcov
-*.gcov.out
-lcov*.info
-coverage/
-coverage-html-stamp
-*.vcproj
-*.vcxproj
-win32ver.rc
-*.exe
-lib*dll.def
-lib*.pc
+*.gcno
 
-# Local excludes in root directory
-/GNUmakefile
-/config.cache
-/config.log
-/config.status
-/pgsql.sln
-/pgsql.sln.cache
-/Debug/
-/Release/
-/tmp_install/
-/portlock/
+# Build output
+gmake.out
+gmake_install.out
+
+# Deprecated/orphaned files (don't track)
+src/backend/postmaster/auto_index_worker.c
+src/backend/utils/auto_index.c
+src/include/auto_index.h
+
+# PostgreSQL build artifacts
+Makefile.port
+Makefile.global
+config.cache
+config.log
+config.status
+GNUmakefile
