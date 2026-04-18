@@ -39,6 +39,8 @@
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
 
 /* Must be first for SQL declarations */
 PG_MODULE_MAGIC;
@@ -97,7 +99,7 @@ static int auto_index_cost_threshold = AUTO_INDEX_COST_THRESHOLD;
 static double auto_index_selectivity_threshold = AUTO_INDEX_SELECTIVITY_THRESHOLD;
 static bool auto_index_enabled = true;
 static int auto_index_max_workers = 4;
-static bool auto_index_debug = false;
+static bool auto_index_debug = true;
 
 /* Hook variables */
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -124,7 +126,7 @@ static void AutoIndexUpdateEntry(TrackingEntry *entry, Cost cost,
 								  uint64 rows_processed, uint64 rows_matched);
 static bool AutoIndexCheckThreshold(TrackingEntry *entry);
 static double AutoIndexCalculateSelectivity(const TrackingEntry *entry);
-static void AutoIndexLogStats(void);
+// static void AutoIndexLogStats(void);
 
 /* ===== Module Initialization ===== */
 
@@ -200,7 +202,7 @@ _PG_init(void)
 		"Enable debug logging for sequential scans",
 		"When enabled, logs details about tracked sequential scans.",
 		&auto_index_debug,
-		false,
+		true,
 		PGC_SIGHUP,
 		0,
 		NULL, NULL, NULL);
@@ -267,7 +269,7 @@ auto_index_shmem_startup(void)
 		/* Get and assign LWLock */
 		lock_tranche_id = LWLockNewTrancheId();
 		auto_index_stats->lock = &(GetNamedLWLockTranche("AutoIndex"))[0];
-		LWLockInitialize(auto_index_stats->lock, lock_tranche_id);
+		LWLockInitialize((LWLock *) auto_index_stats->lock, lock_tranche_id);
 	}
 
 	/* Initialize hash table for tracking (rel_oid, attr_no) pairs */
@@ -313,7 +315,7 @@ auto_index_analyze_seqscan_node(const SeqScan *seqscan, const Relation rel)
 	scan = (Scan *) seqscan;
 
 	/* Extract equality predicates from the scan filter (qual field is in Plan) */
-	indexed_cols = auto_index_extract_equality_cols(scan->plan.qual);
+	indexed_cols = auto_index_extract_equality_cols((Node *) scan->plan.qual);
 
 	if (indexed_cols == NULL)
 		return;					/* No equality predicates found */
@@ -407,7 +409,7 @@ recurse:
 		ListCell   *lc;
 		foreach(lc, plan->initPlan)
 		{
-			SubPlan    *subplan = (SubPlan *) lfirst(lc);
+			(void) lfirst(lc);  /* subplan - reserved for future use */
 			/* SubPlan contains plan_id, not direct plan pointer;
 			 * we skip processing subplans for now */
 		}
@@ -428,6 +430,7 @@ recurse:
  * Returns:
  *   true if expression is an equality predicate, false otherwise
  */
+// check
 static bool
 auto_index_is_equality_predicate(const OpExpr *expr)
 {
@@ -505,6 +508,7 @@ auto_index_extract_var_attno(const Var *var)
  *   Bitmapset of attribute numbers involved in equality predicates
  *   NULL if no equality predicates found
  */
+// check
 static Bitmapset *
 auto_index_extract_equality_cols(Node *qual)
 {
@@ -517,7 +521,6 @@ auto_index_extract_equality_cols(Node *qual)
 	if (IsA(qual, OpExpr))
 	{
 		OpExpr	   *expr = (OpExpr *) qual;
-		AttrNumber	attno;
 
 		/* Check if this is an equality predicate */
 		if (!auto_index_is_equality_predicate(expr))
@@ -544,12 +547,11 @@ auto_index_extract_equality_cols(Node *qual)
 			 * Include in result if one side is a Var and the other is a Const
 			 * or expression. This handles: col = const, const = col, col = col
 			 */
-			if (left_attno != InvalidAttrNumber && !IsA(left, Var))
+			if (left_attno != InvalidAttrNumber && IsA(left, Var))
 				result = bms_add_member(result, left_attno);
-			else if (right_attno != InvalidAttrNumber && !IsA(right, Var))
+			else if (right_attno != InvalidAttrNumber && IsA(right, Var))
 				result = bms_add_member(result, right_attno);
-			else if (left_attno != InvalidAttrNumber)
-				result = bms_add_member(result, left_attno);
+
 		}
 	}
 	else if (IsA(qual, BoolExpr))
@@ -652,26 +654,42 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 		key.attr_no = attr_no;
 
 		/* Find or create tracking entry */
-		LWLockAcquire(auto_index_stats->lock, LW_EXCLUSIVE);
+		LWLockAcquire((LWLock *) auto_index_stats->lock, LW_EXCLUSIVE);
 		{
 			entry = (TrackingEntry *) hash_search(auto_index_hash, &key,
 												   HASH_ENTER, &found);
 
-			if (!found)
-			{
+			if (!found){
 				/* Initialize new entry */
 				entry->key = key;
-				entry->scan_count = 0;
-				entry->accumulated_cost = 0;
-				entry->rows_processed = 0;
-				entry->rows_matched = 0;
+				entry->scan_count = 1;
+				entry->accumulated_cost = cost;
+				entry->rows_processed = rows_processed;
+				entry->rows_matched = rows_matched;
 				entry->triggered = false;
 				auto_index_stats->num_entries++;
-			}
+				auto_index_stats->total_scans++;
 
-			/* Update tracking statistics */
-			AutoIndexUpdateEntry(entry, cost, rows_processed, rows_matched);
-			auto_index_stats->total_scans++;
+				if(auto_index_debug){
+					ereport(LOG,
+					(errmsg("AutoIndex [NEW ENTRY]: Tracking started for Relation '%s', Column '%s'. Cost: %.2f",
+							get_rel_name(key.rel_oid), 
+							get_attname(key.rel_oid, key.attr_no, false), 
+							cost)));
+				}
+			}else{
+				/* Update tracking statistics */
+				AutoIndexUpdateEntry(entry, cost, rows_processed, rows_matched);
+				auto_index_stats->total_scans++;
+				if(auto_index_debug){
+					ereport(LOG,
+					(errmsg("AutoIndex [UPDATE ENTRY]: Updated tracking for Relation '%s', Column '%s'. Total Cost: %lu, Total Scans: %lu",
+							get_rel_name(key.rel_oid), 
+							get_attname(key.rel_oid, key.attr_no, false), 
+							entry->accumulated_cost,
+							entry->scan_count)));
+				}
+			}
 
 			/* Check if threshold exceeded */
 			if (!entry->triggered && AutoIndexCheckThreshold(entry))
@@ -681,11 +699,14 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 
 				if (auto_index_debug)
 					ereport(LOG,
-							(errmsg("auto_index: threshold exceeded for (%u, %d) on table %s",
-									rel_oid, attr_no, rel_name)));
+					(errmsg("AutoIndex [THRESHOLD REACHED]: Relation '%s', Column '%s' exceeded cost threshold (%lu >= %d). Triggering Index Creation!",
+							get_rel_name(entry->key.rel_oid), 
+							get_attname(entry->key.rel_oid, entry->key.attr_no, false), 
+							entry->accumulated_cost,
+							auto_index_cost_threshold)));	
 			}
 		}
-		LWLockRelease(auto_index_stats->lock);
+		LWLockRelease((LWLock *) auto_index_stats->lock);
 	}
 }
 
@@ -748,19 +769,19 @@ AutoIndexCalculateSelectivity(const TrackingEntry *entry)
  *
  * Logs current tracking statistics (for debugging/monitoring)
  */
-static void
-AutoIndexLogStats(void)
-{
-	if (!auto_index_enabled || auto_index_stats == NULL)
-		return;
+// static void
+// AutoIndexLogStats(void)
+// {
+// 	if (!auto_index_enabled || auto_index_stats == NULL)
+// 		return;
 
-	ereport(LOG,
-			(errmsg("auto_index stats: entries=%d, scans=%lu, triggered=%lu, created=%lu",
-					auto_index_stats->num_entries,
-					auto_index_stats->total_scans,
-					auto_index_stats->indices_triggered,
-					auto_index_stats->indices_created)));
-}
+// 	ereport(LOG,
+// 			(errmsg("auto_index stats: entries=%d, scans=%lu, triggered=%lu, created=%lu",
+// 					auto_index_stats->num_entries,
+// 					auto_index_stats->total_scans,
+// 					auto_index_stats->indices_triggered,
+// 					auto_index_stats->indices_created)));
+// }
 
 /* ===== SQL-Callable Functions ===== */
 
@@ -797,18 +818,99 @@ get_auto_index_stats(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		LWLockAcquire(auto_index_stats->lock, LW_SHARED);
+		LWLockAcquire((LWLock *) auto_index_stats->lock, LW_SHARED);
 		{
 			values[0] = Int32GetDatum(auto_index_stats->num_entries);
 			values[1] = Int64GetDatum(auto_index_stats->total_scans);
 			values[2] = Int64GetDatum(auto_index_stats->indices_triggered);
 			values[3] = Int64GetDatum(auto_index_stats->indices_created);
 		}
-		LWLockRelease(auto_index_stats->lock);
+		LWLockRelease((LWLock *) auto_index_stats->lock);
 	}
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	result = HeapTupleGetDatum(tuple);
 
 	PG_RETURN_DATUM(result);
+}
+
+/*
+ * get_auto_index_entries() returns SETOF record
+ * Returns all tracking entries currently in the shared memory hash table.
+ * 
+ * Uses the simple approach without tuplestore
+ */
+PG_FUNCTION_INFO_V1(get_auto_index_entries);
+
+Datum
+get_auto_index_entries(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc tupdesc;
+    HASH_SEQ_STATUS status;
+    TrackingEntry *entry;
+    Tuplestorestate *tupstore;
+    MemoryContext resultcxt;
+    
+    /* Build result tuple descriptor */
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("return type must be a row type")));
+    
+    BlessTupleDesc(tupdesc);
+    
+    /* Verify materialize mode allowed */
+    if (rsinfo == NULL || (rsinfo->allowedModes & SFRM_Materialize) == 0)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("materialize mode not allowed")));
+    
+    /* Create tuplestore in function's per-query context */
+    resultcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    MemoryContextSwitchTo(resultcxt);
+    
+    /* Set return info */
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult = tupstore;
+    rsinfo->setDesc = tupdesc;
+    
+    /* If no data, return empty result */
+    if (auto_index_stats == NULL || auto_index_hash == NULL || auto_index_stats->num_entries == 0)
+        PG_RETURN_VOID();
+    
+    /* Acquire lock and iterate */
+    LWLockAcquire((LWLock *) auto_index_stats->lock, LW_SHARED);
+    hash_seq_init(&status, auto_index_hash);
+    
+    while ((entry = (TrackingEntry *) hash_seq_search(&status)) != NULL)
+    {
+        Datum values[5];
+        bool nulls[5] = {false, false, false, false, false};
+        char *relname;
+        char *attname;
+        
+        relname = get_rel_name(entry->key.rel_oid);
+        attname = get_attname(entry->key.rel_oid, entry->key.attr_no, true);
+        
+        if (relname)
+            values[0] = CStringGetTextDatum(relname);
+        else
+            nulls[0] = true;
+        
+        if (attname)
+            values[1] = CStringGetTextDatum(attname);
+        else
+            nulls[1] = true;
+        
+        values[2] = Int64GetDatum(entry->scan_count);
+        values[3] = Float8GetDatum(entry->accumulated_cost);
+        values[4] = BoolGetDatum(entry->triggered);
+        
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+    
+    /* Release lock */
+    LWLockRelease((LWLock *) auto_index_stats->lock);
+    
+    PG_RETURN_VOID();
 }

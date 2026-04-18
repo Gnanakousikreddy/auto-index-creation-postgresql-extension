@@ -16,6 +16,22 @@ LANGUAGE c STABLE PARALLEL SAFE;
 COMMENT ON FUNCTION get_auto_index_stats() IS 
     'Returns current auto_index tracking statistics: number of tracked entries, total sequential scans, indices triggered, and indices created';
 
+-- Debug: just return count
+-- CREATE FUNCTION get_auto_index_count()
+-- RETURNS int
+-- AS 'auto_index', 'get_auto_index_count'
+-- LANGUAGE c STABLE;
+
+-- View detailed tracking entries in the hash table
+CREATE FUNCTION get_auto_index_entries()
+RETURNS SETOF record
+AS 'auto_index', 'get_auto_index_entries'
+LANGUAGE c STABLE
+ROWS 100;
+
+COMMENT ON FUNCTION get_auto_index_entries() IS 
+    'Returns detailed contents of the auto_index shared memory hash table';
+
 -- GUC parameters registered by the extension:
 --   auto_index.enabled (bool) - Enable/disable autonomous indexing
 --   auto_index.cost_threshold (int) - Cost threshold for triggering index creation
