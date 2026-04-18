@@ -386,6 +386,19 @@ auto_index_walk_plan_tree(const Plan *plan, QueryDesc *queryDesc)
 		}
 
 		/*
+		 * Skip system catalogs (pg_catalog, pg_toast, etc.)
+		 * System catalog relations typically have OIDs in low range
+		 */
+		if (rte->relid > 0 && rte->relid < FirstNormalObjectId)
+		{
+			if (auto_index_debug){
+				ereport(LOG,
+						(errmsg("auto_index: ignoring system catalog relation %u", rte->relid)));
+			}
+			goto recurse;
+		}
+
+		/*
 		 * Open the relation to get metadata. This is safe because:
 		 * 1. We're called from ExecutorStart, before execution begins
 		 * 2. The relation is already locked by the executor
@@ -421,48 +434,39 @@ recurse:
 /*
  * auto_index_is_equality_predicate
  *
- * Checks if an OpExpr represents an equality comparison (e.g., col = value).
- * Returns true if the expression is of the form: Var = Const or Const = Var
- *
- * Parameters:
- *   expr: OpExpr to check
- *
- * Returns:
- *   true if expression is an equality predicate, false otherwise
+ * Safely determines if an operator expression is strictly an equality ('=') predicate.
+ * Checks the argument count and queries the system catalog for the operator name.
  */
-// check
 static bool
 auto_index_is_equality_predicate(const OpExpr *expr)
 {
+	char *opname;
+	bool is_equality = false;
+
+	/* Sanity check */
 	if (expr == NULL || !IsA(expr, OpExpr))
 		return false;
 
-	/*
-	 * In PostgreSQL, equality operators typically have well-known names like:
-	 * =, for various types (int4eq, texteq, etc.)
-	 * 
-	 * We check the operator's name. For now, use a conservative approach:
-	 * check if the operator is listed in the default equality family.
-	 * 
-	 * Alternative: Get the operator's name and check if it contains "eq"
-	 * A simpler approach: use op_strategy() to get the operator strategy,
-	 * but that requires additional includes.
-	 * 
-	 * Most direct approach: check if this is a basic = operator by looking
-	 * at common patterns. For Phase 3, we use a heuristic check:
-	 * - OpExpr with 2 arguments
-	 * - At least one argument is a Var
-	 * - The other is typically a Const or expression
+	/* Binary operators must have exactly 2 arguments */
+	if (list_length(expr->args) != 2)
+		return false;
+
+	/* * Lookup the operator's actual name in the pg_operator catalog
+	 * using the operator's OID (opno).
 	 */
+	opname = get_opname(expr->opno);
 
-	/* For now, accept all 2-argument operators as potential equality operators.
-	 * Refinement: Could check operator name, but requires additional lookups.
-	 * This will be refined in later phases. */
-	
-	if (list_length(expr->args) == 2)
-		return true;
+	if (opname != NULL)
+	{
+		/* Check if the operator symbol is exactly '=' */
+		if (strcmp(opname, "=") == 0)
+			is_equality = true;
+		
+		/* get_opname allocates memory, so we must free it to prevent leaks */
+		pfree(opname);
+	}
 
-	return false;
+	return is_equality;
 }
 
 /*
@@ -490,6 +494,17 @@ auto_index_extract_var_attno(const Var *var)
 	return var->varattno;
 }
 
+
+static Node *
+auto_index_strip_relabels(Node *node)
+{
+    while (node != NULL && IsA(node, RelabelType))
+    {
+        node = (Node *) ((RelabelType *) node)->arg;
+    }
+    return node;
+}
+
 /*
  * auto_index_extract_equality_cols
  *
@@ -502,11 +517,11 @@ auto_index_extract_var_attno(const Var *var)
  * - Ignores OR expressions and other operators
  *
  * Parameters:
- *   qual: Query qualification (WHERE clause) node tree
+ * qual: Query qualification (WHERE clause) node tree
  *
  * Returns:
- *   Bitmapset of attribute numbers involved in equality predicates
- *   NULL if no equality predicates found
+ * Bitmapset of attribute numbers involved in equality predicates
+ * NULL if no equality predicates found
  */
 // check
 static Bitmapset *
@@ -532,8 +547,11 @@ auto_index_extract_equality_cols(Node *qual)
 		 */
 		if (list_length(expr->args) == 2)
 		{
-			Node	   *left = linitial(expr->args);
-			Node	   *right = lsecond(expr->args);
+			/* * Extract the left and right arguments, stripping away any RelabelType 
+			 * nodes that were added for implicit casting (e.g., varchar to text).
+			 */
+			Node	   *left = (Node *) auto_index_strip_relabels(linitial(expr->args));
+			Node	   *right = (Node *) auto_index_strip_relabels(lsecond(expr->args));
 			AttrNumber	left_attno = InvalidAttrNumber;
 			AttrNumber	right_attno = InvalidAttrNumber;
 
@@ -547,11 +565,22 @@ auto_index_extract_equality_cols(Node *qual)
 			 * Include in result if one side is a Var and the other is a Const
 			 * or expression. This handles: col = const, const = col, col = col
 			 */
-			if (left_attno != InvalidAttrNumber && IsA(left, Var))
+			if (left_attno != InvalidAttrNumber && !IsA(right, Var))
+			{
+				/* Case 1: Column on the left, Constant/Expression on the right */
 				result = bms_add_member(result, left_attno);
-			else if (right_attno != InvalidAttrNumber && IsA(right, Var))
+			}
+			else if (right_attno != InvalidAttrNumber && !IsA(left, Var))
+			{
+				/* Case 2: Constant/Expression on the left, Column on the right */
 				result = bms_add_member(result, right_attno);
-
+			}
+			else if (left_attno != InvalidAttrNumber && right_attno != InvalidAttrNumber)
+			{
+				/* Case 3: Column on the left AND Column on the right */
+				result = bms_add_member(result, left_attno);
+				result = bms_add_member(result, right_attno);
+			}
 		}
 	}
 	else if (IsA(qual, BoolExpr))

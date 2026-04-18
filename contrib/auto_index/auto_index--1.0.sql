@@ -24,10 +24,14 @@ COMMENT ON FUNCTION get_auto_index_stats() IS
 
 -- View detailed tracking entries in the hash table
 CREATE FUNCTION get_auto_index_entries()
-RETURNS SETOF record
-AS 'auto_index', 'get_auto_index_entries'
-LANGUAGE c STABLE
-ROWS 100;
+RETURNS TABLE (
+    relation_name text,
+    column_name text,
+    total_scans bigint,
+    accumulated_cost float8,
+    is_triggered boolean
+) AS 'auto_index', 'get_auto_index_entries'
+LANGUAGE c STABLE;
 
 COMMENT ON FUNCTION get_auto_index_entries() IS 
     'Returns detailed contents of the auto_index shared memory hash table';
