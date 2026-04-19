@@ -355,36 +355,25 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
     Cost             scan_cost;
     uint64           actual_matched_rows = 0;
     uint64           total_table_rows = 0; 
+	// BlockNumber       physical_pages;
 
     if (seqscan_state == NULL || rel == NULL)
         return;
-    /* Get the planner blueprint so we can read the WHERE clause (qual) */
     seqscan = (SeqScan *) seqscan_state->ss.ps.plan;
-    /* Extract equality predicates from the filter */
     indexed_cols = auto_index_extract_equality_cols((Node *) seqscan->scan.plan.qual);
     if (indexed_cols == NULL)
-        return; /* No equality predicates found */
-    /* * THE MAGIC: Get the actual runtime execution statistics!
-     */
+        return;
+ 
     instr = seqscan_state->ss.ps.instrument;
 	worker_instr = seqscan_state->ss.ps.worker_instrument;
 
     if (instr){
-        /* instr->ntuples is the EXACT number of rows that passed the WHERE clause */
         actual_matched_rows += (uint64) (instr->ntuples + instr->tuplecount);;
 		if (auto_index_debug)			ereport(LOG,
 					(errmsg("auto_index: relation %u has instrumentation with ntuples=%.0f, using as actual matched rows",
 							rel->rd_id, instr->ntuples + instr->tuplecount)));
     }
-	// else{
-    //     /* Fallback to planner guess if instrumentation failed to initialize */
-    //     actual_matched_rows = (uint64) seqscan->scan.plan.plan_rows;
-	// 	if (auto_index_debug)
-	// 		ereport(LOG,
-	// 				(errmsg("auto_index: instrumentation not available for relation %u, using planner estimate of matched rows: %lu",
-	// 						rel->rd_id, actual_matched_rows)));
-    // }
-
+	
 	if(worker_instr){
         for (int i = 0; i < worker_instr->num_workers; i++){
             actual_matched_rows += (uint64) (worker_instr->instrument[i].ntuples + 
@@ -399,31 +388,52 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 	
 	if (!instr && !worker_instr){
         actual_matched_rows = (uint64) seqscan->scan.plan.plan_rows;
+		if (auto_index_debug)
+			ereport(LOG,
+					(errmsg("auto_index: instrumentation not available for relation %u, using planner estimate of matched rows: %lu",
+							rel->rd_id, actual_matched_rows)));
     }
 
-    /* * Get the physical total size of the table. 
-     * A Sequential Scan always reads every single row in the table, so 
-     * reltuples represents our true "Rows Processed" metric.
-     */
+	// physical_pages = RelationGetNumberOfBlocks(rel);
+	// if(physical_pages < 10){
+	// 	if(auto_index_debug){
+	// 		ereport(LOG,
+	// 				(errmsg("auto_index: relation %u has only %u physical pages, likely very small, skipping tracking",
+	// 						rel->rd_id, physical_pages)));
+	// 	}
+	// 	bms_free(indexed_cols);
+	// 	return;
+	// }
+	
     if (rel->rd_rel->reltuples > 0){
 		total_table_rows = (uint64) rel->rd_rel->reltuples;
 		if(auto_index_debug)
 			ereport(LOG,
 					(errmsg("auto_index: relation %u has reltuples=%.0f, using as total rows processed",
 							rel->rd_id, rel->rd_rel->reltuples)));
-	}
-	else{
+	}else{
+		BlockNumber estimated_pages;
+		double estimated_tuples;
+		double allvisfrac;
+		int32 attr_width[MaxHeapAttributeNumber];
+
+		table_block_relation_estimate_size(
+			rel, 
+			attr_width, 
+			&estimated_pages, 
+			&estimated_tuples, 
+			&allvisfrac, 
+			SizeofHeapTupleHeader + sizeof(ItemIdData),
+			BLCKSZ - SizeOfPageHeaderData
+		);
+		total_table_rows = (uint64) estimated_tuples;
 		if(auto_index_debug){
 			ereport(LOG,
-					(errmsg("auto_index: relation %u has no reltuples estimate, defaulting to 0 total rows processed",
-							rel->rd_id)));
+					(errmsg("auto_index: relation %u has no reltuples estimate, using table_block_relation_estimate_size to estimate total rows processed as %.0f",
+							rel->rd_id, estimated_tuples)));
 		}
 	}
-	
-    /* * Sanity check: cap matched rows so it never exceeds total rows.
-     * (PostgreSQL's reltuples is an estimate updated by VACUUM, so it can occasionally 
-     * drift slightly below the actual physical row count before the next VACUUM).
-     */
+
     if (actual_matched_rows > total_table_rows)
         actual_matched_rows = total_table_rows;
 
@@ -435,7 +445,6 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
                         rel->rd_id, RelationGetRelationName(rel), scan_cost, 
                         total_table_rows, actual_matched_rows,
                         bms_num_members(indexed_cols))));
-    /* Record it using your existing tracking function! */
     AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel),
                          scan_cost, total_table_rows, actual_matched_rows, indexed_cols);
     bms_free(indexed_cols);
