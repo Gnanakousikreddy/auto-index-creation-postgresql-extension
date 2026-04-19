@@ -306,7 +306,8 @@ auto_index_analyze_seqscan_node(const SeqScan *seqscan, const Relation rel)
 {
 	Bitmapset  *indexed_cols;
 	Cost		scan_cost;
-	uint64		estimated_rows;
+	uint64		rows_processed;
+	uint64		estimated_matched_rows;
 	Scan	   *scan;
 
 	if (seqscan == NULL || rel == NULL)
@@ -322,18 +323,31 @@ auto_index_analyze_seqscan_node(const SeqScan *seqscan, const Relation rel)
 
 	/* Extract cost and row estimation from plan node */
 	scan_cost = scan->plan.total_cost - scan->plan.startup_cost;
-	estimated_rows = (uint64) scan->plan.plan_rows;
+	estimated_matched_rows = (uint64) scan->plan.plan_rows;
+
+	if(rel->rd_rel->reltuples > 0){
+		rows_processed = (uint64) rel->rd_rel->reltuples;
+	}else {
+		rows_processed = 0;
+		ereport(LOG,
+				(errmsg("auto_index: relation %u has no row count statistics, using 0 for rows processed",
+						rel->rd_id)));
+	}
+
+	if(estimated_matched_rows > rows_processed){
+		estimated_matched_rows = rows_processed;
+	}
 
 	if (auto_index_debug)
 		ereport(LOG,
 				(errmsg("auto_index: analyzing SeqScan on relation %u, "
-						"cost=%.2f, estimated_rows=%lu, indexed_cols=%d",
-						rel->rd_id, scan_cost, estimated_rows,
+						"cost=%.2f, estimated_matched_rows=%lu, indexed_cols=%d",
+						rel->rd_id, scan_cost, estimated_matched_rows,
 						bms_num_members(indexed_cols))));
 
 	/* Record this sequential scan in the tracking system */
 	AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel),
-						 scan_cost, estimated_rows, 0, indexed_cols);
+						 scan_cost, estimated_matched_rows, 0, indexed_cols);
 
 	bms_free(indexed_cols);
 }
@@ -701,10 +715,12 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 
 				if(auto_index_debug){
 					ereport(LOG,
-					(errmsg("AutoIndex [NEW ENTRY]: Tracking started for Relation '%s', Column '%s'. Cost: %.2f",
-							get_rel_name(key.rel_oid), 
-							get_attname(key.rel_oid, key.attr_no, false), 
-							cost)));
+					(errmsg("AutoIndex [NEW ENTRY]: Tracking started for Relation '%d', Column '%d'. Cost: %.2f, Rows Processed: %lu, Rows Matched: %lu",
+							key.rel_oid, 
+							key.attr_no, 
+							cost,
+							rows_processed,
+							rows_matched)));
 				}
 			}else{
 				/* Update tracking statistics */
@@ -712,11 +728,13 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 				auto_index_stats->total_scans++;
 				if(auto_index_debug){
 					ereport(LOG,
-					(errmsg("AutoIndex [UPDATE ENTRY]: Updated tracking for Relation '%s', Column '%s'. Total Cost: %lu, Total Scans: %lu",
-							get_rel_name(key.rel_oid), 
-							get_attname(key.rel_oid, key.attr_no, false), 
+					(errmsg("AutoIndex [UPDATE ENTRY]: Updated tracking for Relation '%d', Column '%d'. Total Cost: %lu, Total Scans: %lu, Rows Processed: %lu, Rows Matched: %lu",
+							key.rel_oid, 
+							key.attr_no, 
 							entry->accumulated_cost,
-							entry->scan_count)));
+							entry->scan_count,
+							entry->rows_processed,
+							entry->rows_matched)));
 				}
 			}
 
@@ -728,9 +746,9 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 
 				if (auto_index_debug)
 					ereport(LOG,
-					(errmsg("AutoIndex [THRESHOLD REACHED]: Relation '%s', Column '%s' exceeded cost threshold (%lu >= %d). Triggering Index Creation!",
-							get_rel_name(entry->key.rel_oid), 
-							get_attname(entry->key.rel_oid, entry->key.attr_no, false), 
+					(errmsg("AutoIndex [THRESHOLD REACHED]: Relation '%d', Column '%d' exceeded cost threshold (%lu >= %d). Triggering Index Creation!",
+							entry->key.rel_oid, 
+							entry->key.attr_no, 
 							entry->accumulated_cost,
 							auto_index_cost_threshold)));	
 			}
