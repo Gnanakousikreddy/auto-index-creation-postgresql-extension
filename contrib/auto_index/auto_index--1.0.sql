@@ -29,7 +29,8 @@ RETURNS TABLE (
     column_name text,
     total_scans bigint,
     accumulated_cost float8,
-    is_triggered boolean
+    is_triggered boolean,
+    benefit bigint
 ) AS 'auto_index', 'get_auto_index_entries'
 LANGUAGE c STABLE;
 

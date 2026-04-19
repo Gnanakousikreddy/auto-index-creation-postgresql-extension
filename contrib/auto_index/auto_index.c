@@ -41,6 +41,7 @@
 #include "utils/memutils.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "optimizer/cost.h"
 
 /* Must be first for SQL declarations */
 PG_MODULE_MAGIC;
@@ -72,6 +73,7 @@ typedef struct TrackingEntry
 	TrackingKey key;				/* Embedded key */
 	uint64		scan_count;			/* Number of sequential scans */
 	uint64		accumulated_cost;	/* Total estimated cost from planner */
+	uint64      benefit;            /* Estimated cost benefit of indexing */
 	uint64		rows_processed;		/* Total rows scanned */
 	uint64		rows_matched;		/* Total rows matching equality predicate */
 	bool		triggered;			/* Whether index creation was triggered */
@@ -123,10 +125,10 @@ static AttrNumber auto_index_extract_var_attno(const Var *var);
 static bool auto_index_is_equality_predicate(const OpExpr *expr);
 
 static void AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
-								  Cost cost, uint64 rows_processed, uint64 rows_matched,
+								  Cost cost, uint64 rows_processed, uint64 rows_matched, uint64 benefit,
 								  Bitmapset *indexed_attrs);
 static void AutoIndexUpdateEntry(TrackingEntry *entry, Cost cost,
-								  uint64 rows_processed, uint64 rows_matched);
+								  uint64 rows_processed, uint64 rows_matched, uint64 benefit);
 static bool AutoIndexCheckThreshold(TrackingEntry *entry);
 static double AutoIndexCalculateSelectivity(const TrackingEntry *entry);
 // static void AutoIndexLogStats(void);
@@ -348,14 +350,18 @@ auto_index_executor_end(QueryDesc *queryDesc)
  */
 static void
 auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
-    SeqScan         *seqscan;
+    
+	SeqScan         *seqscan;
     Instrumentation *instr;
 	WorkerInstrumentation *worker_instr;
     Bitmapset       *indexed_cols;
     Cost             scan_cost;
+	Cost 			estimated_index_cost;
+	Cost            benefit;
+	double selectivity;	
     uint64           actual_matched_rows = 0;
     uint64           total_table_rows = 0; 
-	// BlockNumber       physical_pages;
+	BlockNumber       physical_pages;
 
     if (seqscan_state == NULL || rel == NULL)
         return;
@@ -394,7 +400,7 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 							rel->rd_id, actual_matched_rows)));
     }
 
-	// physical_pages = RelationGetNumberOfBlocks(rel);
+	physical_pages = RelationGetNumberOfBlocks(rel);
 	// if(physical_pages < 10){
 	// 	if(auto_index_debug){
 	// 		ereport(LOG,
@@ -427,6 +433,7 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 			BLCKSZ - SizeOfPageHeaderData
 		);
 		total_table_rows = (uint64) estimated_tuples;
+		if(total_table_rows ==0) total_table_rows = 1;
 		if(auto_index_debug){
 			ereport(LOG,
 					(errmsg("auto_index: relation %u has no reltuples estimate, using table_block_relation_estimate_size to estimate total rows processed as %.0f",
@@ -434,19 +441,54 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 		}
 	}
 
-    if (actual_matched_rows > total_table_rows)
+    if (actual_matched_rows > total_table_rows){
         actual_matched_rows = total_table_rows;
+	}
 
-    scan_cost = seqscan->scan.plan.total_cost - seqscan->scan.plan.startup_cost;
-    if (auto_index_debug)
+	selectivity = (double)actual_matched_rows / (double) total_table_rows;
+	if(selectivity > 0.2){
+		if (auto_index_debug){
+            ereport(LOG,
+                    (errmsg("auto_index: query too broad (selectivity %.2f) for relation %u, skipping.",
+                            selectivity, rel->rd_id)));
+		}
+        bms_free(indexed_cols);
+        return;
+	}
+
+	if(rel->rd_rel->reltuples > 0){
+		scan_cost = seqscan->scan.plan.total_cost - seqscan->scan.plan.startup_cost;
+	}else{
+		scan_cost = ((double) physical_pages * DEFAULT_SEQ_PAGE_COST) + 
+                    ((double) total_table_rows * (DEFAULT_CPU_TUPLE_COST + DEFAULT_CPU_OPERATOR_COST));
+		if (auto_index_debug){
+            ereport(LOG,
+                    (errmsg("auto_index: missing stats on relation %u. Recalculated cost to %.2f",
+                            rel->rd_id, scan_cost)));
+		}
+	}
+
+	estimated_index_cost = ((double) actual_matched_rows * DEFAULT_RANDOM_PAGE_COST) + 
+                           ((double) actual_matched_rows * DEFAULT_CPU_INDEX_TUPLE_COST);
+	benefit = scan_cost - estimated_index_cost;
+	if(benefit <= 0){
+		if(auto_index_debug){
+			ereport(LOG,
+					(errmsg("auto_index: estimated index cost %.2f exceeds scan cost %.2f for relation %u, skipping.",
+							estimated_index_cost, scan_cost, rel->rd_id)));
+		}
+		bms_free(indexed_cols);
+		return;
+	}
+
+    if (auto_index_debug){
         ereport(LOG,
-                (errmsg("auto_index: analyzed actual SeqScan on relation %u (%s), "
-                        "cost=%.2f, actual_processed=%lu, actual_matched=%lu, indexed_cols=%d",
-                        rel->rd_id, RelationGetRelationName(rel), scan_cost, 
-                        total_table_rows, actual_matched_rows,
-                        bms_num_members(indexed_cols))));
+                (errmsg("auto_index: relation %u (%s) | Selectivity: %.4f | Seq Cost: %.2f | Idx Cost: %.2f | Benefit: %.2f",
+                        rel->rd_id, RelationGetRelationName(rel), selectivity, 
+                        scan_cost, estimated_index_cost, benefit)));
+	}
     AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel),
-                         scan_cost, total_table_rows, actual_matched_rows, indexed_cols);
+                         scan_cost, total_table_rows, actual_matched_rows, benefit, indexed_cols);
     bms_free(indexed_cols);
 }
 
@@ -740,7 +782,7 @@ auto_index_extract_equality_cols(Node *qual)
  */
 static void
 AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
-					  Cost cost, uint64 rows_processed, uint64 rows_matched,
+					  Cost cost, uint64 rows_processed, uint64 rows_matched, uint64 benefit,
 					  Bitmapset *indexed_attrs)
 {
 	TrackingKey key;
@@ -770,32 +812,35 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 				entry->accumulated_cost = cost;
 				entry->rows_processed = rows_processed;
 				entry->rows_matched = rows_matched;
+				entry->benefit = benefit;
 				entry->triggered = false;
 				auto_index_stats->num_entries++;
 				auto_index_stats->total_scans++;
 
 				if(auto_index_debug){
 					ereport(LOG,
-					(errmsg("AutoIndex [NEW ENTRY]: Tracking started for Relation '%d', Column '%d'. Cost: %.2f, Rows Processed: %lu, Rows Matched: %lu",
+					(errmsg("AutoIndex [NEW ENTRY]: Tracking started for Relation '%d', Column '%d'. Cost: %.2f, Rows Processed: %lu, Rows Matched: %lu, Benefit: %lu",
 							key.rel_oid, 
 							key.attr_no, 
 							cost,
 							rows_processed,
-							rows_matched)));
+							rows_matched,
+							benefit)));
 				}
 			}else{
 				/* Update tracking statistics */
-				AutoIndexUpdateEntry(entry, cost, rows_processed, rows_matched);
+				AutoIndexUpdateEntry(entry, cost, rows_processed, rows_matched, benefit);
 				auto_index_stats->total_scans++;
 				if(auto_index_debug){
 					ereport(LOG,
-					(errmsg("AutoIndex [UPDATE ENTRY]: Updated tracking for Relation '%d', Column '%d'. Total Cost: %lu, Total Scans: %lu, Rows Processed: %lu, Rows Matched: %lu",
+					(errmsg("AutoIndex [UPDATE ENTRY]: Updated tracking for Relation '%d', Column '%d'. Total Cost: %lu, Total Scans: %lu, Rows Processed: %lu, Rows Matched: %lu, Benefit: %lu",
 							key.rel_oid, 
 							key.attr_no, 
 							entry->accumulated_cost,
 							entry->scan_count,
 							entry->rows_processed,
-							entry->rows_matched)));
+							entry->rows_matched,
+							entry->benefit)));
 				}
 			}
 
@@ -825,12 +870,13 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
  */
 static void
 AutoIndexUpdateEntry(TrackingEntry *entry, Cost cost,
-					  uint64 rows_processed, uint64 rows_matched)
+					  uint64 rows_processed, uint64 rows_matched, uint64 benefit)
 {
 	entry->scan_count++;
 	entry->accumulated_cost += (uint64) cost;
 	entry->rows_processed += rows_processed;
 	entry->rows_matched += rows_matched;
+	entry->benefit += benefit;
 }
 
 /*
@@ -846,7 +892,7 @@ AutoIndexCheckThreshold(TrackingEntry *entry)
 	double		selectivity;
 
 	/* Check cost threshold */
-	if (entry->accumulated_cost <= (uint64) auto_index_cost_threshold)
+	if (entry->benefit <= (uint64) auto_index_cost_threshold)
 		return false;
 
 	/* Check selectivity threshold */
@@ -992,8 +1038,8 @@ get_auto_index_entries(PG_FUNCTION_ARGS)
     
     while ((entry = (TrackingEntry *) hash_seq_search(&status)) != NULL)
     {
-        Datum values[5];
-        bool nulls[5] = {false, false, false, false, false};
+        Datum values[6];
+        bool nulls[6] = {false, false, false, false, false, false};
         char *relname;
         char *attname;
         
@@ -1013,6 +1059,7 @@ get_auto_index_entries(PG_FUNCTION_ARGS)
         values[2] = Int64GetDatum(entry->scan_count);
         values[3] = Float8GetDatum(entry->accumulated_cost);
         values[4] = BoolGetDatum(entry->triggered);
+		values[5] = Int64GetDatum(entry->benefit);
         
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
