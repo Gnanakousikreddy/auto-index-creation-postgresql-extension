@@ -105,6 +105,7 @@ static bool auto_index_debug = true;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorStart_hook_type prev_executor_start_hook = NULL;
+static ExecutorEnd_hook_type prev_executor_end_hook = NULL;
 
 /* ===== Function Declarations ===== */
 
@@ -114,6 +115,8 @@ void _PG_fini(void);
 static void auto_index_shmem_request(void);
 static void auto_index_shmem_startup(void);
 static void auto_index_executor_start(QueryDesc *queryDesc, int eflags);
+static void auto_index_executor_end(QueryDesc *queryDesc);
+static void auto_index_walk_planstate_tree(PlanState *planstate, QueryDesc *queryDesc);
 
 static Bitmapset *auto_index_extract_equality_cols(Node *qual);
 static AttrNumber auto_index_extract_var_attno(const Var *var);
@@ -146,6 +149,9 @@ _PG_init(void)
 	/* Setup executor hook */
 	prev_executor_start_hook = ExecutorStart_hook;
 	ExecutorStart_hook = auto_index_executor_start;
+
+	prev_executor_end_hook = ExecutorEnd_hook;
+	ExecutorEnd_hook = auto_index_executor_end;
 
 	/* Register GUC parameters */
 	DefineCustomIntVariable(
@@ -217,6 +223,7 @@ _PG_fini(void)
 	shmem_request_hook = prev_shmem_request_hook;
 	shmem_startup_hook = prev_shmem_startup_hook;
 	ExecutorStart_hook = prev_executor_start_hook;
+	ExecutorEnd_hook = prev_executor_end_hook;
 }
 
 /* ===== Shared Memory Initialization ===== */
@@ -289,6 +296,44 @@ auto_index_shmem_startup(void)
 	ereport(LOG, (errmsg("auto_index: shared memory initialized")));
 }
 
+static void
+auto_index_executor_start(QueryDesc *queryDesc, int eflags)
+{
+    /* * CRITICAL: Force PostgreSQL to count the actual rows during execution.
+     * We must do this before passing control to the standard executor.
+     */
+    if (auto_index_enabled && queryDesc != NULL)
+    {
+        queryDesc->instrument_options |= INSTRUMENT_ROWS;
+    }
+
+    /* Chain to previous hook or standard executor */
+    if (prev_executor_start_hook)
+        prev_executor_start_hook(queryDesc, eflags);
+    else
+        standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+auto_index_executor_end(QueryDesc *queryDesc)
+{
+    /* Walk the execution state tree to find SeqScans *after* instrumentation is finalized */
+    /* We must do this AFTER standard_ExecutorEnd so instr->ntuples is populated correctly */
+    if (auto_index_enabled && queryDesc != NULL && queryDesc->planstate != NULL)
+    {
+        auto_index_walk_planstate_tree(queryDesc->planstate, queryDesc);
+    }
+
+	/* Chain to previous hook or standard executor to finish cleanup FIRST */
+    /* This is crucial: instrumentation data is finalized during ExecutorEnd */
+    if (prev_executor_end_hook)
+        prev_executor_end_hook(queryDesc);
+    else
+        standard_ExecutorEnd(queryDesc);
+
+}
+
+
 /* ===== Plan Tree Analysis Functions (Phase 3) ===== */
 
 /*
@@ -302,54 +347,98 @@ auto_index_shmem_startup(void)
  *   rel: Relation object for the scanned table
  */
 static void
-auto_index_analyze_seqscan_node(const SeqScan *seqscan, const Relation rel)
-{
-	Bitmapset  *indexed_cols;
-	Cost		scan_cost;
-	uint64		rows_processed;
-	uint64		estimated_matched_rows;
-	Scan	   *scan;
+auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
+    SeqScan         *seqscan;
+    Instrumentation *instr;
+	WorkerInstrumentation *worker_instr;
+    Bitmapset       *indexed_cols;
+    Cost             scan_cost;
+    uint64           actual_matched_rows = 0;
+    uint64           total_table_rows = 0; 
 
-	if (seqscan == NULL || rel == NULL)
-		return;
+    if (seqscan_state == NULL || rel == NULL)
+        return;
+    /* Get the planner blueprint so we can read the WHERE clause (qual) */
+    seqscan = (SeqScan *) seqscan_state->ss.ps.plan;
+    /* Extract equality predicates from the filter */
+    indexed_cols = auto_index_extract_equality_cols((Node *) seqscan->scan.plan.qual);
+    if (indexed_cols == NULL)
+        return; /* No equality predicates found */
+    /* * THE MAGIC: Get the actual runtime execution statistics!
+     */
+    instr = seqscan_state->ss.ps.instrument;
+	worker_instr = seqscan_state->ss.ps.worker_instrument;
 
-	scan = (Scan *) seqscan;
+    if (instr){
+        /* instr->ntuples is the EXACT number of rows that passed the WHERE clause */
+        actual_matched_rows += (uint64) (instr->ntuples + instr->tuplecount);;
+		if (auto_index_debug)			ereport(LOG,
+					(errmsg("auto_index: relation %u has instrumentation with ntuples=%.0f, using as actual matched rows",
+							rel->rd_id, instr->ntuples + instr->tuplecount)));
+    }
+	// else{
+    //     /* Fallback to planner guess if instrumentation failed to initialize */
+    //     actual_matched_rows = (uint64) seqscan->scan.plan.plan_rows;
+	// 	if (auto_index_debug)
+	// 		ereport(LOG,
+	// 				(errmsg("auto_index: instrumentation not available for relation %u, using planner estimate of matched rows: %lu",
+	// 						rel->rd_id, actual_matched_rows)));
+    // }
 
-	/* Extract equality predicates from the scan filter (qual field is in Plan) */
-	indexed_cols = auto_index_extract_equality_cols((Node *) scan->plan.qual);
+	if(worker_instr){
+        for (int i = 0; i < worker_instr->num_workers; i++){
+            actual_matched_rows += (uint64) (worker_instr->instrument[i].ntuples + 
+                                             worker_instr->instrument[i].tuplecount);
+        }
+		if (auto_index_debug){
+			ereport(LOG,
+			(errmsg("auto_index: relation %u has worker instrumentation with num_workers=%d, adding their ntuples to actual matched rows, total now: %lu",
+				rel->rd_id, worker_instr->num_workers, actual_matched_rows)));
+		}
+	}	
+	
+	if (!instr && !worker_instr){
+        actual_matched_rows = (uint64) seqscan->scan.plan.plan_rows;
+    }
 
-	if (indexed_cols == NULL)
-		return;					/* No equality predicates found */
-
-	/* Extract cost and row estimation from plan node */
-	scan_cost = scan->plan.total_cost - scan->plan.startup_cost;
-	estimated_matched_rows = (uint64) scan->plan.plan_rows;
-
-	if(rel->rd_rel->reltuples > 0){
-		rows_processed = (uint64) rel->rd_rel->reltuples;
-	}else {
-		rows_processed = 0;
-		ereport(LOG,
-				(errmsg("auto_index: relation %u has no row count statistics, using 0 for rows processed",
-						rel->rd_id)));
+    /* * Get the physical total size of the table. 
+     * A Sequential Scan always reads every single row in the table, so 
+     * reltuples represents our true "Rows Processed" metric.
+     */
+    if (rel->rd_rel->reltuples > 0){
+		total_table_rows = (uint64) rel->rd_rel->reltuples;
+		if(auto_index_debug)
+			ereport(LOG,
+					(errmsg("auto_index: relation %u has reltuples=%.0f, using as total rows processed",
+							rel->rd_id, rel->rd_rel->reltuples)));
 	}
-
-	if(estimated_matched_rows > rows_processed){
-		estimated_matched_rows = rows_processed;
+	else{
+		if(auto_index_debug){
+			ereport(LOG,
+					(errmsg("auto_index: relation %u has no reltuples estimate, defaulting to 0 total rows processed",
+							rel->rd_id)));
+		}
 	}
+	
+    /* * Sanity check: cap matched rows so it never exceeds total rows.
+     * (PostgreSQL's reltuples is an estimate updated by VACUUM, so it can occasionally 
+     * drift slightly below the actual physical row count before the next VACUUM).
+     */
+    if (actual_matched_rows > total_table_rows)
+        actual_matched_rows = total_table_rows;
 
-	if (auto_index_debug)
-		ereport(LOG,
-				(errmsg("auto_index: analyzing SeqScan on relation %u, "
-						"cost=%.2f, estimated_matched_rows=%lu, indexed_cols=%d",
-						rel->rd_id, scan_cost, estimated_matched_rows,
-						bms_num_members(indexed_cols))));
-
-	/* Record this sequential scan in the tracking system */
-	AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel),
-						 scan_cost, estimated_matched_rows, 0, indexed_cols);
-
-	bms_free(indexed_cols);
+    scan_cost = seqscan->scan.plan.total_cost - seqscan->scan.plan.startup_cost;
+    if (auto_index_debug)
+        ereport(LOG,
+                (errmsg("auto_index: analyzed actual SeqScan on relation %u (%s), "
+                        "cost=%.2f, actual_processed=%lu, actual_matched=%lu, indexed_cols=%d",
+                        rel->rd_id, RelationGetRelationName(rel), scan_cost, 
+                        total_table_rows, actual_matched_rows,
+                        bms_num_members(indexed_cols))));
+    /* Record it using your existing tracking function! */
+    AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel),
+                         scan_cost, total_table_rows, actual_matched_rows, indexed_cols);
+    bms_free(indexed_cols);
 }
 
 /*
@@ -364,83 +453,46 @@ auto_index_analyze_seqscan_node(const SeqScan *seqscan, const Relation rel)
  *   queryDesc: Query descriptor for relation lookups
  */
 static void
-auto_index_walk_plan_tree(const Plan *plan, QueryDesc *queryDesc)
+auto_index_walk_planstate_tree(PlanState *planstate, QueryDesc *queryDesc)
 {
-	if (plan == NULL || queryDesc == NULL)
-		return;
+    if (planstate == NULL || queryDesc == NULL)
+        return;
 
-	/* Check if this is a sequential scan node */
-	if (IsA(plan, SeqScan))
-	{
-		SeqScan    *seqscan = (SeqScan *) plan;
-		Scan	   *scan = (Scan *) seqscan;
-		RangeTblEntry *rte;
-		Relation	rel;
-
-		/*
-		 * scanrelid is an index into the range table, not an OID.
-		 * We need to look it up in the PlannedStmt's range table.
-		 * Range table indices are 1-based.
-		 */
-		if (scan->scanrelid < 1 || scan->scanrelid > list_length(queryDesc->plannedstmt->rtable))
+    /* Check if this node is an actively executing sequential scan */
+    if (nodeTag(planstate) == T_SeqScanState)
+    {
+        SeqScanState *seqscan_state = (SeqScanState *) planstate;
+        Relation      rel = seqscan_state->ss.ss_currentRelation;
+		if(rel == NULL) return;
+        
+		if (rel->rd_id > 0 && rel->rd_id < FirstNormalObjectId)
 		{
 			if (auto_index_debug)
+			{
 				ereport(LOG,
-						(errmsg("auto_index: invalid scanrelid %u", scan->scanrelid)));
-			goto recurse;
-		}
-
-		rte = list_nth(queryDesc->plannedstmt->rtable, scan->scanrelid - 1);
-		if (rte == NULL || rte->rtekind != RTE_RELATION)
-		{
-			if (auto_index_debug)
-				ereport(LOG,
-						(errmsg("auto_index: scanrelid %u is not a relation", scan->scanrelid)));
-			goto recurse;
-		}
-
-		/*
-		 * Skip system catalogs (pg_catalog, pg_toast, etc.)
-		 * System catalog relations typically have OIDs in low range
-		 */
-		if (rte->relid > 0 && rte->relid < FirstNormalObjectId)
-		{
-			if (auto_index_debug){
-				ereport(LOG,
-						(errmsg("auto_index: ignoring system catalog relation %u", rte->relid)));
+						(errmsg("auto_index: ignoring system catalog relation %u", rel->rd_id)));
 			}
-			goto recurse;
+		}else if(rel->rd_rel->relkind != RELKIND_RELATION || 
+                     rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT){
+			if (auto_index_debug)			{
+				ereport(LOG,
+						(errmsg("auto_index: ignoring non-permanent relation %u of kind %c",
+								rel->rd_id, rel->rd_rel->relkind)));
+			}
+		}else{
+			auto_index_analyze_seqscan_state(seqscan_state, rel);
 		}
+    }
 
-		/*
-		 * Open the relation to get metadata. This is safe because:
-		 * 1. We're called from ExecutorStart, before execution begins
-		 * 2. The relation is already locked by the executor
-		 * 3. We only read metadata, don't modify anything
-		 */
-		rel = table_open(rte->relid, NoLock);
-		auto_index_analyze_seqscan_node(seqscan, rel);
-		table_close(rel, NoLock);
-	}
-
-recurse:
-	/* Recursively process left and right subtrees */
-	if (plan->lefttree != NULL)
-		auto_index_walk_plan_tree(plan->lefttree, queryDesc);
-	if (plan->righttree != NULL)
-		auto_index_walk_plan_tree(plan->righttree, queryDesc);
-
-	/* Recursively process initPlan list (if present) */
-	if (plan->initPlan != NIL)
-	{
-		ListCell   *lc;
-		foreach(lc, plan->initPlan)
-		{
-			(void) lfirst(lc);  /* subplan - reserved for future use */
-			/* SubPlan contains plan_id, not direct plan pointer;
-			 * we skip processing subplans for now */
-		}
-	}
+    /* * Recursively process left and right subtrees 
+     * Note: PlanState trees use outerPlanState and innerPlanState macros
+     */
+    auto_index_walk_planstate_tree(outerPlanState(planstate), queryDesc);
+    auto_index_walk_planstate_tree(innerPlanState(planstate), queryDesc);
+    
+    /* * SubPlans and InitPlans are skipped for now, similar to your original logic.
+     * They require iterating over planstate->initPlan and planstate->subPlan.
+     */
 }
 
 /* ===== Predicate Extraction Functions (Phase 3) ===== */
@@ -633,30 +685,30 @@ auto_index_extract_equality_cols(Node *qual)
 
 /* ===== Executor Hook Implementation ===== */
 
-static void
-auto_index_executor_start(QueryDesc *queryDesc, int eflags)
-{
-	/* Call previous hook first */
-	if (prev_executor_start_hook)
-		prev_executor_start_hook(queryDesc, eflags);
-	else
-		standard_ExecutorStart(queryDesc, eflags);
+// static void
+// auto_index_executor_start(QueryDesc *queryDesc, int eflags)
+// {
+// 	/* Call previous hook first */
+// 	if (prev_executor_start_hook)
+// 		prev_executor_start_hook(queryDesc, eflags);
+// 	else
+// 		standard_ExecutorStart(queryDesc, eflags);
 
-	/* Phase 3: Analyze query plan for sequential scans with equality predicates
-	 * This hook is called once per query, allowing us to extract plan information
-	 * before execution begins. We analyze the plan tree to identify SeqScan nodes
-	 * and extract their predicates for tracking purposes.
-	 * 
-	 * Note: This phase tracks planned scans. Actual row counting during execution
-	 * happens separately and will be added in a future phase. This phase focuses
-	 * on plan analysis and cost extraction.
-	 */
-	if (!auto_index_enabled || queryDesc == NULL || queryDesc->plannedstmt == NULL)
-		return;
+// 	/* Phase 3: Analyze query plan for sequential scans with equality predicates
+// 	 * This hook is called once per query, allowing us to extract plan information
+// 	 * before execution begins. We analyze the plan tree to identify SeqScan nodes
+// 	 * and extract their predicates for tracking purposes.
+// 	 * 
+// 	 * Note: This phase tracks planned scans. Actual row counting during execution
+// 	 * happens separately and will be added in a future phase. This phase focuses
+// 	 * on plan analysis and cost extraction.
+// 	 */
+// 	if (!auto_index_enabled || queryDesc == NULL || queryDesc->plannedstmt == NULL)
+// 		return;
 
-	/* Walk the plan tree to find and analyze sequential scans */
-	auto_index_walk_plan_tree(queryDesc->plannedstmt->planTree, queryDesc);
-}
+// 	/* Walk the plan tree to find and analyze sequential scans */
+// 	auto_index_walk_plan_tree(queryDesc->plannedstmt->planTree, queryDesc);
+// }
 
 /* ===== Tracking Functions ===== */
 
