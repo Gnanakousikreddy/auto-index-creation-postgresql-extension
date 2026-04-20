@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * auto_index.c
- *    Autonomous Index Creation Infrastructure - Phase 3
+ *    Autonomous Index Creation Infrastructure - Phase 4
  *
  * Tracks sequential scans with equality predicates and maintains statistics
  * for automatic index creation trigger decisions.
@@ -11,7 +11,7 @@
  * - Executor hook: captures sequential scans at execution time
  * - Predicate analysis: extracts indexed columns from scan predicates
  * - Threshold logic: triggers index creation when cost threshold exceeded
- * - Phase 3: Actual sequential scan detection and tracking
+ * - Phase 4: Background worker for async index creation
  *
  * Portions Copyright (c) 2026, CS349 Project Team
  * Based on PostgreSQL Global Development Group
@@ -23,6 +23,7 @@
  */
 #include "postgres.h"
 
+#include "auto_index.h"
 #include "access/hash.h"
 #include "access/heapam.h"
 #include "access/table.h"
@@ -33,7 +34,9 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "optimizer/clauses.h"
+#include "postmaster/bgworker.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
@@ -52,56 +55,19 @@ PG_MODULE_MAGIC;
 #define AUTO_INDEX_COST_THRESHOLD 1000
 #define AUTO_INDEX_SELECTIVITY_THRESHOLD 0.2
 
-/* ===== Shared Memory Structure Definitions ===== */
-
-/*
- * TrackingKey - Hash table key: (relation OID, attribute number)
- * Uniquely identifies a (table, column) pair being tracked
- */
-typedef struct TrackingKey
-{
-	Oid			rel_oid;			/* Table OID */
-	AttrNumber	attr_no;			/* Column attribute number */
-} TrackingKey;
-
-/*
- * TrackingEntry - Hash table value: statistics for one (table, column) pair
- * Maintains accumulated cost and selectivity information
- */
-typedef struct TrackingEntry
-{
-	TrackingKey key;				/* Embedded key */
-	uint64		scan_count;			/* Number of sequential scans */
-	uint64		accumulated_cost;	/* Total estimated cost from planner */
-	uint64      benefit;            /* Estimated cost benefit of indexing */
-	uint64		rows_processed;		/* Total rows scanned */
-	uint64		rows_matched;		/* Total rows matching equality predicate */
-	bool		triggered;			/* Whether index creation was triggered */
-} TrackingEntry;
-
-/*
- * GlobalStats - Shared memory header with global statistics
- */
-typedef struct GlobalStats
-{
-	int			num_entries;		/* Current tracked entries */
-	uint64		total_scans;		/* Total sequential scans tracked */
-	uint64		indices_triggered;	/* Total index creation requests */
-	uint64		indices_created;	/* Total indices successfully created */
-	LWLockPadded *lock;				/* Lock protecting this structure */
-} GlobalStats;
+/* ===== Shared Memory Structure Definitions (in auto_index.h) ===== */
 
 /* ===== Global State (Process-local) ===== */
 
-static GlobalStats *auto_index_stats = NULL;
-static HTAB *auto_index_hash = NULL;
+GlobalStats *auto_index_stats = NULL;
+HTAB *auto_index_hash = NULL;
 
 /* GUC Parameters */
-static int auto_index_cost_threshold = AUTO_INDEX_COST_THRESHOLD;
-static double auto_index_selectivity_threshold = AUTO_INDEX_SELECTIVITY_THRESHOLD;
-static bool auto_index_enabled = true;
-static int auto_index_max_workers = 4;
-static bool auto_index_debug = true;
+int auto_index_cost_threshold = AUTO_INDEX_COST_THRESHOLD;
+double auto_index_selectivity_threshold = AUTO_INDEX_SELECTIVITY_THRESHOLD;
+bool auto_index_enabled = true;
+int auto_index_max_workers = 4;
+char *auto_index_database_name = NULL;
 
 /* Hook variables */
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -131,6 +97,9 @@ static void AutoIndexUpdateEntry(TrackingEntry *entry, Cost cost,
 								  uint64 rows_processed, uint64 rows_matched, uint64 benefit);
 static bool AutoIndexCheckThreshold(TrackingEntry *entry);
 static double AutoIndexCalculateSelectivity(const TrackingEntry *entry);
+
+/* Phase 4: Background worker */
+void auto_index_worker_main(Datum arg) pg_attribute_noreturn();
 // static void AutoIndexLogStats(void);
 
 /* ===== Module Initialization ===== */
@@ -163,7 +132,7 @@ _PG_init(void)
 		"an index creation is triggered (in planner cost units).",
 		&auto_index_cost_threshold,
 		AUTO_INDEX_COST_THRESHOLD,
-		100,
+		0,
 		INT_MAX,
 		PGC_SIGHUP,
 		0,
@@ -205,15 +174,31 @@ _PG_init(void)
 		0,
 		NULL, NULL, NULL);
 
-	DefineCustomBoolVariable(
-		"auto_index.debug",
-		"Enable debug logging for sequential scans",
-		"When enabled, logs details about tracked sequential scans.",
-		&auto_index_debug,
-		true,
-		PGC_SIGHUP,
+	DefineCustomStringVariable(
+		"auto_index.database_name",
+		"Database name for autonomous index creation worker",
+		"Specifies the database that the background worker should connect to for index creation. "
+		"If not set, defaults to the current database.",
+		&auto_index_database_name,
+		"test_db",
+		PGC_POSTMASTER,
 		0,
 		NULL, NULL, NULL);
+
+	/* Phase 4: Register background worker for index creation */
+	{
+		BackgroundWorker worker;
+		memset(&worker, 0, sizeof(BackgroundWorker));
+		snprintf(worker.bgw_name, BGW_MAXLEN, "auto_index worker");
+		snprintf(worker.bgw_type, BGW_MAXLEN, "auto_index");
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = BGW_NEVER_RESTART;
+		snprintf(worker.bgw_library_name, MAXPGPATH, "auto_index");
+		snprintf(worker.bgw_function_name, BGW_MAXLEN, "auto_index_worker_main");
+		worker.bgw_main_arg = 0;
+		RegisterBackgroundWorker(&worker);
+	}
 
 	ereport(LOG, (errmsg("auto_index extension loaded")));
 }
@@ -274,6 +259,12 @@ auto_index_shmem_startup(void)
 		auto_index_stats->total_scans = 0;
 		auto_index_stats->indices_triggered = 0;
 		auto_index_stats->indices_created = 0;
+
+		/* Phase 4: Worker coordination fields */
+		auto_index_stats->worker_available = false;
+		auto_index_stats->last_poll_time = 0;
+		auto_index_stats->worker_polls = 0;
+		auto_index_stats->worker_wakes = 0;
 
 		/* Get and assign LWLock */
 		lock_tranche_id = LWLockNewTrancheId();
@@ -375,9 +366,9 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 
     if (instr){
         actual_matched_rows += (uint64) (instr->ntuples + instr->tuplecount);;
-		if (auto_index_debug)			ereport(LOG,
-					(errmsg("auto_index: relation %u has instrumentation with ntuples=%.0f, using as actual matched rows",
-							rel->rd_id, instr->ntuples + instr->tuplecount)));
+		ereport(LOG,
+		(errmsg("auto_index: relation %u has instrumentation with ntuples=%.0f, using as actual matched rows",
+				rel->rd_id, instr->ntuples + instr->tuplecount)));
     }
 	
 	if(worker_instr){
@@ -385,38 +376,35 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
             actual_matched_rows += (uint64) (worker_instr->instrument[i].ntuples + 
                                              worker_instr->instrument[i].tuplecount);
         }
-		if (auto_index_debug){
-			ereport(LOG,
-			(errmsg("auto_index: relation %u has worker instrumentation with num_workers=%d, adding their ntuples to actual matched rows, total now: %lu",
-				rel->rd_id, worker_instr->num_workers, actual_matched_rows)));
-		}
+		
+		ereport(LOG,
+		(errmsg("auto_index: relation %u has worker instrumentation with num_workers=%d, adding their ntuples to actual matched rows, total now: %lu",
+			rel->rd_id, worker_instr->num_workers, actual_matched_rows)));
+		
 	}	
 	
 	if (!instr && !worker_instr){
         actual_matched_rows = (uint64) seqscan->scan.plan.plan_rows;
-		if (auto_index_debug)
-			ereport(LOG,
-					(errmsg("auto_index: instrumentation not available for relation %u, using planner estimate of matched rows: %lu",
-							rel->rd_id, actual_matched_rows)));
+		
+		ereport(LOG,
+				(errmsg("auto_index: instrumentation not available for relation %u, using planner estimate of matched rows: %lu",
+						rel->rd_id, actual_matched_rows)));
     }
 
 	physical_pages = RelationGetNumberOfBlocks(rel);
 	// if(physical_pages < 10){
-	// 	if(auto_index_debug){
-	// 		ereport(LOG,
-	// 				(errmsg("auto_index: relation %u has only %u physical pages, likely very small, skipping tracking",
-	// 						rel->rd_id, physical_pages)));
-	// 	}
+		// ereport(LOG,
+		// 		(errmsg("auto_index: relation %u has only %u physical pages, likely very small, skipping tracking",
+		// 				rel->rd_id, physical_pages)));
 	// 	bms_free(indexed_cols);
 	// 	return;
 	// }
 	
     if (rel->rd_rel->reltuples > 0){
 		total_table_rows = (uint64) rel->rd_rel->reltuples;
-		if(auto_index_debug)
-			ereport(LOG,
-					(errmsg("auto_index: relation %u has reltuples=%.0f, using as total rows processed",
-							rel->rd_id, rel->rd_rel->reltuples)));
+		ereport(LOG,
+				(errmsg("auto_index: relation %u has reltuples=%.0f, using as total rows processed",
+						rel->rd_id, rel->rd_rel->reltuples)));
 	}else{
 		BlockNumber estimated_pages;
 		double estimated_tuples;
@@ -434,11 +422,9 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 		);
 		total_table_rows = (uint64) estimated_tuples;
 		if(total_table_rows ==0) total_table_rows = 1;
-		if(auto_index_debug){
-			ereport(LOG,
-					(errmsg("auto_index: relation %u has no reltuples estimate, using table_block_relation_estimate_size to estimate total rows processed as %.0f",
-							rel->rd_id, estimated_tuples)));
-		}
+		ereport(LOG,
+				(errmsg("auto_index: relation %u has no reltuples estimate, using table_block_relation_estimate_size to estimate total rows processed as %.0f",
+						rel->rd_id, estimated_tuples)));
 	}
 
     if (actual_matched_rows > total_table_rows){
@@ -447,11 +433,9 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 
 	selectivity = (double)actual_matched_rows / (double) total_table_rows;
 	if(selectivity > 0.2){
-		if (auto_index_debug){
-            ereport(LOG,
-                    (errmsg("auto_index: query too broad (selectivity %.2f) for relation %u, skipping.",
-                            selectivity, rel->rd_id)));
-		}
+		ereport(LOG,
+				(errmsg("auto_index: query too broad (selectivity %.2f) for relation %u, skipping.",
+						selectivity, rel->rd_id)));
         bms_free(indexed_cols);
         return;
 	}
@@ -461,32 +445,28 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel){
 	}else{
 		scan_cost = ((double) physical_pages * DEFAULT_SEQ_PAGE_COST) + 
                     ((double) total_table_rows * (DEFAULT_CPU_TUPLE_COST + DEFAULT_CPU_OPERATOR_COST));
-		if (auto_index_debug){
-            ereport(LOG,
-                    (errmsg("auto_index: missing stats on relation %u. Recalculated cost to %.2f",
-                            rel->rd_id, scan_cost)));
-		}
+		ereport(LOG,
+				(errmsg("auto_index: missing stats on relation %u. Recalculated cost to %.2f",
+						rel->rd_id, scan_cost)));
 	}
 
 	estimated_index_cost = ((double) actual_matched_rows * DEFAULT_RANDOM_PAGE_COST) + 
                            ((double) actual_matched_rows * DEFAULT_CPU_INDEX_TUPLE_COST);
+	// estimated_index_cost = 0;
 	benefit = scan_cost - estimated_index_cost;
 	if(benefit <= 0){
-		if(auto_index_debug){
-			ereport(LOG,
-					(errmsg("auto_index: estimated index cost %.2f exceeds scan cost %.2f for relation %u, skipping.",
-							estimated_index_cost, scan_cost, rel->rd_id)));
-		}
+		ereport(LOG,
+				(errmsg("auto_index: estimated index cost %.2f exceeds scan cost %.2f for relation %u, skipping.",
+						estimated_index_cost, scan_cost, rel->rd_id)));
 		bms_free(indexed_cols);
 		return;
 	}
 
-    if (auto_index_debug){
-        ereport(LOG,
-                (errmsg("auto_index: relation %u (%s) | Selectivity: %.4f | Seq Cost: %.2f | Idx Cost: %.2f | Benefit: %.2f",
-                        rel->rd_id, RelationGetRelationName(rel), selectivity, 
-                        scan_cost, estimated_index_cost, benefit)));
-	}
+	ereport(LOG,
+			(errmsg("auto_index: relation %u (%s) | Selectivity: %.4f | Seq Cost: %.2f | Idx Cost: %.2f | Benefit: %.2f",
+					rel->rd_id, RelationGetRelationName(rel), selectivity, 
+					scan_cost, estimated_index_cost, benefit)));
+	
     AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel),
                          scan_cost, total_table_rows, actual_matched_rows, benefit, indexed_cols);
     bms_free(indexed_cols);
@@ -518,18 +498,14 @@ auto_index_walk_planstate_tree(PlanState *planstate, QueryDesc *queryDesc)
         
 		if (rel->rd_id > 0 && rel->rd_id < FirstNormalObjectId)
 		{
-			if (auto_index_debug)
-			{
-				ereport(LOG,
-						(errmsg("auto_index: ignoring system catalog relation %u", rel->rd_id)));
-			}
+			ereport(LOG,
+					(errmsg("auto_index: ignoring system catalog relation %u", rel->rd_id)));
+			
 		}else if(rel->rd_rel->relkind != RELKIND_RELATION || 
                      rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT){
-			if (auto_index_debug)			{
-				ereport(LOG,
-						(errmsg("auto_index: ignoring non-permanent relation %u of kind %c",
-								rel->rd_id, rel->rd_rel->relkind)));
-			}
+			ereport(LOG,
+					(errmsg("auto_index: ignoring non-permanent relation %u of kind %c",
+							rel->rd_id, rel->rd_rel->relkind)));
 		}else{
 			auto_index_analyze_seqscan_state(seqscan_state, rel);
 		}
@@ -814,34 +790,37 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 				entry->rows_matched = rows_matched;
 				entry->benefit = benefit;
 				entry->triggered = false;
+				
+				/* Phase 4: Initialize background worker coordination fields */
+				entry->worker_processing = false;
+				entry->creation_attempts = 0;
+				
 				auto_index_stats->num_entries++;
 				auto_index_stats->total_scans++;
 
-				if(auto_index_debug){
-					ereport(LOG,
-					(errmsg("AutoIndex [NEW ENTRY]: Tracking started for Relation '%d', Column '%d'. Cost: %.2f, Rows Processed: %lu, Rows Matched: %lu, Benefit: %lu",
-							key.rel_oid, 
-							key.attr_no, 
-							cost,
-							rows_processed,
-							rows_matched,
-							benefit)));
-				}
+				ereport(LOG,
+				(errmsg("AutoIndex [NEW ENTRY]: Tracking started for Relation '%d', Column '%d'. Cost: %.2f, Rows Processed: %lu, Rows Matched: %lu, Benefit: %lu",
+						key.rel_oid, 
+						key.attr_no, 
+						cost,
+						rows_processed,
+						rows_matched,
+						benefit)));
+				
 			}else{
 				/* Update tracking statistics */
 				AutoIndexUpdateEntry(entry, cost, rows_processed, rows_matched, benefit);
 				auto_index_stats->total_scans++;
-				if(auto_index_debug){
-					ereport(LOG,
-					(errmsg("AutoIndex [UPDATE ENTRY]: Updated tracking for Relation '%d', Column '%d'. Total Cost: %lu, Total Scans: %lu, Rows Processed: %lu, Rows Matched: %lu, Benefit: %lu",
-							key.rel_oid, 
-							key.attr_no, 
-							entry->accumulated_cost,
-							entry->scan_count,
-							entry->rows_processed,
-							entry->rows_matched,
-							entry->benefit)));
-				}
+				
+				ereport(LOG,
+				(errmsg("AutoIndex [UPDATE ENTRY]: Updated tracking for Relation '%d', Column '%d'. Total Cost: %lu, Total Scans: %lu, Rows Processed: %lu, Rows Matched: %lu, Benefit: %lu",
+						key.rel_oid, 
+						key.attr_no, 
+						entry->accumulated_cost,
+						entry->scan_count,
+						entry->rows_processed,
+						entry->rows_matched,
+						entry->benefit)));
 			}
 
 			/* Check if threshold exceeded */
@@ -850,13 +829,12 @@ AutoIndexTrackSeqscan(Oid rel_oid, const char *rel_name,
 				entry->triggered = true;
 				auto_index_stats->indices_triggered++;
 
-				if (auto_index_debug)
-					ereport(LOG,
-					(errmsg("AutoIndex [THRESHOLD REACHED]: Relation '%d', Column '%d' exceeded cost threshold (%lu >= %d). Triggering Index Creation!",
-							entry->key.rel_oid, 
-							entry->key.attr_no, 
-							entry->accumulated_cost,
-							auto_index_cost_threshold)));	
+				ereport(LOG,
+				(errmsg("AutoIndex [THRESHOLD REACHED]: Relation '%d', Column '%d' exceeded cost threshold (%lu >= %d). Triggering Index Creation!",
+						entry->key.rel_oid, 
+						entry->key.attr_no, 
+						entry->accumulated_cost,
+						auto_index_cost_threshold)));	
 			}
 		}
 		LWLockRelease((LWLock *) auto_index_stats->lock);
@@ -1068,4 +1046,52 @@ get_auto_index_entries(PG_FUNCTION_ARGS)
     LWLockRelease((LWLock *) auto_index_stats->lock);
     
     PG_RETURN_VOID();
+}
+
+/*
+ * get_auto_index_worker_status() returns TABLE (...)
+ * Returns current background worker status
+ */
+PG_FUNCTION_INFO_V1(get_auto_index_worker_status);
+
+Datum
+get_auto_index_worker_status(PG_FUNCTION_ARGS)
+{
+    TupleDesc  tupdesc;
+    Datum      values[4];
+    bool       nulls[4] = {false, false, false, false};
+    HeapTuple  tuple;
+    Datum      result;
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("function returning record called in context "
+                        "that cannot accept type record")));
+
+    BlessTupleDesc(tupdesc);
+
+    if (auto_index_stats == NULL)
+    {
+        values[0] = BoolGetDatum(false);
+        values[1] = Int64GetDatum(0);
+        values[2] = Int64GetDatum(0);
+        values[3] = Int64GetDatum(0);
+    }
+    else
+    {
+        LWLockAcquire((LWLock *) auto_index_stats->lock, LW_SHARED);
+        {
+            values[0] = BoolGetDatum(auto_index_stats->worker_available);
+            values[1] = Int64GetDatum((int64) auto_index_stats->last_poll_time);
+            values[2] = Int64GetDatum(auto_index_stats->worker_polls);
+            values[3] = Int64GetDatum(auto_index_stats->worker_wakes);
+        }
+        LWLockRelease((LWLock *) auto_index_stats->lock);
+    }
+
+    tuple = heap_form_tuple(tupdesc, values, nulls);
+    result = HeapTupleGetDatum(tuple);
+
+    PG_RETURN_DATUM(result);
 }

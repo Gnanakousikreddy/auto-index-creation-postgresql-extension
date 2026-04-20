@@ -3,7 +3,8 @@
 MODULE_big = auto_index
 OBJS = \
 	$(WIN32RES) \
-	auto_index.o
+	auto_index.o \
+	auto_index_worker.o
 
 EXTENSION = auto_index
 DATA = auto_index--1.0.sql

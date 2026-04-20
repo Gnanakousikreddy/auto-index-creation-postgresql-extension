@@ -44,3 +44,16 @@ COMMENT ON FUNCTION get_auto_index_entries() IS
 --   auto_index.max_workers (int) - Maximum concurrent index creation workers
 --   auto_index.debug (bool) - Enable debug logging
 
+-- Get worker status
+CREATE FUNCTION get_auto_index_worker_status()
+RETURNS TABLE (
+    worker_available boolean,
+    last_poll_time timestamp with time zone,
+    worker_polls bigint,
+    worker_wakes bigint
+) AS 'auto_index', 'get_auto_index_worker_status'
+LANGUAGE c STABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION get_auto_index_worker_status() IS 
+    'Returns current background worker status: availability, last poll time, and activity counters';
+
