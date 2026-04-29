@@ -1,104 +1,86 @@
-# Auto Index PostgreSQL Extension
+# Auto Index PostgreSQL Extension - Replication Guide
 
-Autonomous Index Creation for PostgreSQL - Automatically tracks sequential scans and creates indices for frequently accessed columns.
-
-## Installation
-
-### Build the Extension
+## 0. Crucial: Environment Setup
+Before running ANY `make` or `psql` commands, you **must** set your PATH. This ensures you are using the version of PostgreSQL we built (18.x) and not the system default (17.x).
 
 ```bash
-cd postgresql/contrib/auto_index
-make
+export PATH=/home/lelouch/postgres/install/bin:$PATH
+
+# Verify this returns /home/lelouch/postgres/install/bin/pg_config
+which pg_config
+
+# Verify this returns "PostgreSQL 18.3" (or your local version)
+pg_config --version
+```
+
+## 1. Prerequisites: Patch and Install HypoPG
+
+```bash
+cd /home/lelouch/postgres/contrib/hypopg
+export PATH=/home/lelouch/postgres/install/bin:$PATH
 make install
 ```
 
-### Enable in PostgreSQL
-
-Edit `postgresql.conf`:
-
-```ini
-shared_preload_libraries = 'auto_index'
-```
-
-Restart PostgreSQL:
+## 2. Build and Install auto_index
 
 ```bash
-pg_ctl -D $PGDATA restart
+cd /home/lelouch/postgres/contrib/auto_index
+export PATH=/home/lelouch/postgres/install/bin:$PATH
+make install
 ```
 
-## GUC Parameters
-
-Once loaded, configure via SQL:
-
-```sql
--- Enable/disable autonomous indexing
-SET auto_index.enabled = true;
-
--- Cost threshold to trigger indexing (planner cost units)
-SET auto_index.cost_threshold = 1000;
-
--- Selectivity threshold for index creation (0.0 to 1.0)
-SET auto_index.selectivity_threshold = 0.2;
-
--- Max concurrent index creation workers
-SET auto_index.max_workers = 4;
-
--- View current settings
-SHOW auto_index.enabled;
-SHOW auto_index.cost_threshold;
-```
-
-## Architecture
-
-### Phase 1-2 (Current)
-
-Foundation layer implemented:
-- GUC parameter registration
-- Shared memory structures (AutoIndexStats, tracking hash table)
-- Basic tracking infrastructure
-
-### Phase 3-7 (Planned)
-
-- Sequential scan tracking via executor hooks
-- Predicate analysis and extraction
-- Background worker for index creation
-- SPI-based CREATE INDEX CONCURRENTLY
-- Cost-based threshold calculation
-- Multi-column index support
-- Selectivity filtering
-
-## Development
-
-### Key Files
-
-- `auto_index.c` - Main extension code
-- `auto_index.control` - Extension metadata
-- `auto_index--1.0.sql` - Extension SQL script
-- `Makefile` - Build configuration
-
-### Testing
-
-Run in single-user mode:
+## 3. Initialize and Configure PostgreSQL
 
 ```bash
-postgres --single -D $PGDATA test
-SELECT 1;
-\q
+export PATH=/home/lelouch/postgres/install/bin:$PATH
+export PGDATA=/home/lelouch/postgres/data
+
+# Initialize if needed
+if [ ! -d "$PGDATA" ]; then
+    initdb -D "$PGDATA"
+    echo "port = 5433" >> "$PGDATA/postgresql.conf"
+    echo "shared_preload_libraries = 'hypopg, auto_index'" >> "$PGDATA/postgresql.conf"
+    echo "auto_index.database_name = 'test_db'" >> "$PGDATA/postgresql.conf"
+fi
+
+# Start server
+pg_ctl -D "$PGDATA" -l "$PGDATA/logfile" restart
 ```
 
-## References
+## 4. Database Setup and Verification
 
-- PostgreSQL Extension Documentation: https://www.postgresql.org/docs/current/extend-extensions.html
-- Shared Libraries: https://www.postgresql.org/docs/current/xfunc-c.html
-- GUC Parameters: https://www.postgresql.org/docs/current/runtime-config-custom.html
+```bash
+export PATH=/home/lelouch/postgres/install/bin:$PATH
 
-## CS349 Project Team
+# Create DB and Extensions
+psql -h localhost -p 5433 -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'test_db'" | grep -q 1 || createdb -h localhost -p 5433 test_db
+psql -h localhost -p 5433 -d test_db -c "CREATE EXTENSION IF NOT EXISTS hypopg; CREATE EXTENSION IF NOT EXISTS auto_index;"
 
-- Lohit Adhitya (23b0952)
-- GnanaKoushik (23b1000)
-- AkshayKarthik (23b0981)
-- Maneendhar (23b0969)
+# Populate Data (only if missing)
+psql -h localhost -p 5433 -d test_db -c "DROP TABLE IF EXISTS test_table;"
+psql -h localhost -p 5433 -d test_db -c "CREATE TABLE test_table (id serial primary key, val integer, data text);"
+psql -h localhost -p 5433 -d test_db -c "INSERT INTO test_table (val, data) SELECT (3)::integer, md5(random()::text) FROM generate_series(1, 1000);" 
+psql -h localhost -p 5433 -d test_db -c "ANALYZE test_table;"
 
-## License
+# Trigger and Verify
+for i in {1..5}; do psql -h localhost -p 5433 -d test_db -c "SELECT count(*) FROM test_table WHERE val = 500;" > /dev/null; done
+sleep 5
+psql -h localhost -p 5433 -d test_db -c "\d test_table"
+psql -h localhost -p 5433 -d test_db -c "SELECT * FROM get_auto_index_stats();"
+```
 
-Based on PostgreSQL, same license (PostgreSQL License)
+## 5. Reset for Re-testing
+To run the test again, you need to remove the automatically created indexes and clear the shared memory stats:
+
+```bash
+export PATH=/home/lelouch/postgres/install/bin:$PATH
+
+# 1. Drop all auto-generated indexes
+psql -h localhost -p 5433 -d test_db -c "DO \$\$ DECLARE r RECORD; BEGIN FOR r IN SELECT indexname FROM pg_indexes WHERE indexname LIKE 'idx_auto_%' LOOP EXECUTE 'DROP INDEX ' || quote_ident(r.indexname); END LOOP; END \$\$;"
+
+# 2. Reset the shared memory stats and tracking table
+psql -h localhost -p 5433 -d test_db -c "SELECT reset_auto_index();"
+
+# Optional: Clear the data table if you want to repopulate
+# psql -h localhost -p 5433 -d test_db -c "DROP TABLE test_table;"
+```

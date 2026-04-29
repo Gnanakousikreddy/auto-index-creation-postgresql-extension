@@ -57,3 +57,12 @@ LANGUAGE c STABLE PARALLEL SAFE;
 COMMENT ON FUNCTION get_auto_index_worker_status() IS 
     'Returns current background worker status: availability, last poll time, and activity counters';
 
+-- Reset statistics and tracking data
+CREATE FUNCTION reset_auto_index()
+RETURNS void
+AS 'auto_index', 'reset_auto_index'
+LANGUAGE c VOLATILE PARALLEL SAFE;
+
+COMMENT ON FUNCTION reset_auto_index() IS 
+    'Clears all tracking statistics and hash table entries from shared memory';
+

@@ -50,16 +50,9 @@
 /* Forward declarations */
 static void auto_index_worker_sighup(SIGNAL_ARGS);
 static void auto_index_worker_sigterm(SIGNAL_ARGS);
-PGDLLEXPORT void auto_index_worker_main(Datum arg) pg_attribute_noreturn();
 
 /* ===== Shared Memory Access ===== */
-/* These are defined in auto_index.c */
-extern GlobalStats *auto_index_stats;
-extern HTAB *auto_index_hash;
-extern int auto_index_cost_threshold;
-extern double auto_index_selectivity_threshold;
-extern bool auto_index_enabled;
-extern char *auto_index_database_name;
+/* These are defined in auto_index.c and declared in auto_index.h */
 
 /* ===== Worker State ===== */
 

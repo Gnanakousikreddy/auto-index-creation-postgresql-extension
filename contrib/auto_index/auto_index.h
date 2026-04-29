@@ -47,9 +47,8 @@ typedef struct TrackingEntry
 	uint32     creation_attempts;		/* Number of creation attempts */
 } TrackingEntry;
 
-/*
- * GlobalStats - Shared memory header with global statistics
- */
+/* ===== Global Stats ===== */
+
 typedef struct GlobalStats
 {
 	int			num_entries;		/* Current tracked entries */
@@ -64,5 +63,16 @@ typedef struct GlobalStats
 	uint64		worker_polls;		/* Total number of polls since startup */
 	uint64		worker_wakes;		/* Total times worker was woken for work */
 } GlobalStats;
+
+/* Global variables (defined in auto_index.c) */
+extern GlobalStats *auto_index_stats;
+extern struct HTAB *auto_index_hash;
+extern double auto_index_selectivity_threshold;
+extern bool auto_index_enabled;
+extern int auto_index_max_workers;
+extern char *auto_index_database_name;
+
+/* Background worker entry point */
+extern void auto_index_worker_main(Datum arg);
 
 #endif							/* AUTO_INDEX_H */
