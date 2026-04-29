@@ -1,8 +1,3 @@
-/* auto_index--1.0.sql */
-
--- SQL functions and objects for auto_index extension
-
--- Create the monitoring function to view current statistics
 CREATE FUNCTION get_auto_index_stats()
 RETURNS TABLE (
     num_entries int,
@@ -12,23 +7,14 @@ RETURNS TABLE (
 ) AS 'auto_index', 'get_auto_index_stats'
 LANGUAGE c STABLE PARALLEL SAFE;
 
--- Informational comment
 COMMENT ON FUNCTION get_auto_index_stats() IS 
     'Returns current auto_index tracking statistics: number of tracked entries, total sequential scans, indices triggered, and indices created';
 
--- Debug: just return count
--- CREATE FUNCTION get_auto_index_count()
--- RETURNS int
--- AS 'auto_index', 'get_auto_index_count'
--- LANGUAGE c STABLE;
-
--- View detailed tracking entries in the hash table
 CREATE FUNCTION get_auto_index_entries()
 RETURNS TABLE (
     relation_name text,
     column_name text,
     total_scans bigint,
-    accumulated_cost float8,
     is_triggered boolean,
     benefit bigint
 ) AS 'auto_index', 'get_auto_index_entries'
@@ -37,27 +23,6 @@ LANGUAGE c STABLE;
 COMMENT ON FUNCTION get_auto_index_entries() IS 
     'Returns detailed contents of the auto_index shared memory hash table';
 
--- GUC parameters registered by the extension:
---   auto_index.enabled (bool) - Enable/disable autonomous indexing
---   auto_index.cost_threshold (int) - Cost threshold for triggering index creation
---   auto_index.selectivity_threshold (real) - Selectivity threshold for indexed predicates
---   auto_index.max_workers (int) - Maximum concurrent index creation workers
---   auto_index.debug (bool) - Enable debug logging
-
--- Get worker status
-CREATE FUNCTION get_auto_index_worker_status()
-RETURNS TABLE (
-    worker_available boolean,
-    last_poll_time timestamp with time zone,
-    worker_polls bigint,
-    worker_wakes bigint
-) AS 'auto_index', 'get_auto_index_worker_status'
-LANGUAGE c STABLE PARALLEL SAFE;
-
-COMMENT ON FUNCTION get_auto_index_worker_status() IS 
-    'Returns current background worker status: availability, last poll time, and activity counters';
-
--- Reset statistics and tracking data
 CREATE FUNCTION reset_auto_index()
 RETURNS void
 AS 'auto_index', 'reset_auto_index'

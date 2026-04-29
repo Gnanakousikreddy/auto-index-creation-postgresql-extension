@@ -6,17 +6,14 @@ OBJS = \
 	auto_index.o \
 	auto_index_worker.o
 
-# CRITICAL: Link the math library for the log2() function
 SHLIB_LINK += -lm
 
-# Disable bitcode generation to avoid clang dependency
 NO_BITCODE = 1
 
 EXTENSION = auto_index
 DATA = auto_index--1.0.sql
 PGFILEDESC = "auto_index - Autonomous Index Creation"
 
-# This forces the build to use the PGXS infrastructure
 USE_PGXS = 1
 
 ifdef USE_PGXS
