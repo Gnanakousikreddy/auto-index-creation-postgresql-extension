@@ -281,7 +281,7 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel, Quer
     
 	SeqScan         *seqscan;
     Bitmapset       *indexed_cols;
-    Cost             benefit;
+	int col = -1;
 
     if (seqscan_state == NULL || rel == NULL)
         return;
@@ -292,19 +292,23 @@ auto_index_analyze_seqscan_state(SeqScanState *seqscan_state, Relation rel, Quer
     if (indexed_cols == NULL)
         return;
 
+	while ((col = bms_next_member(indexed_cols, col)) >= 0) {
+        Cost benefit;
 
-    benefit = (Cost) get_hypopg_benefit(queryDesc, rel->rd_id, bms_next_member(indexed_cols, -1));
+        benefit = (Cost) get_hypopg_benefit(queryDesc, rel->rd_id, col);
 
-    if (benefit <= 0) {
-        bms_free(indexed_cols);
-        return;
+        if (benefit > 0) {
+            Bitmapset *single_col_bms = bms_make_singleton(col);
+
+            ereport(LOG,
+                    (errmsg("auto_index: HypoPG Benefit for %s (Column %d): %.2f", 
+                            RelationGetRelationName(rel), col, (double)benefit)));
+            
+            AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel), (uint64)benefit, single_col_bms);
+
+            bms_free(single_col_bms);
+        }
     }
-
-	ereport(LOG,
-			(errmsg("auto_index: HypoPG Benefit for %s: %.2f", 
-                    RelationGetRelationName(rel), (double)benefit)));
-	
-    AutoIndexTrackSeqscan(rel->rd_id, RelationGetRelationName(rel), (uint64)benefit, indexed_cols);
 
     bms_free(indexed_cols);
 }
